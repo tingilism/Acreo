@@ -1,0 +1,32 @@
+# Secrets — NEVER commit
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+private*.json
+keystore/
+wallet.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Local runtime artifacts
+*.log
