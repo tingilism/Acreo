@@ -319,9 +319,10 @@ class ConditionalProof:
     action: str; resource: str
     condition: Dict          # {type:'counterparty_proof'|'always', ...}
     valid_after: int; valid_until: int
-    paired_with: Optional[str]   # proof_id of counterparty's ConditionalProof
+    paired_with: Optional[str]   # legacy field — use pair_id instead
     timestamp: int; nonce: str; challenge: str; signature: str
     protocol: str = PROTOCOL
+    pair_id: Optional[str] = None  # shared session id agreed out-of-band
     def to_dict(self): return asdict(self)
     def to_json(self): return json.dumps(self.to_dict(), indent=2)
     @classmethod
@@ -397,6 +398,7 @@ class Identity:
 
     def propose(self, cred: Credential, action: str, resource: str,
                 condition: Dict, valid_until_ms: int,
+                pair_id: Optional[str] = None,
                 paired_with: Optional[str] = None,
                 valid_after_ms: Optional[int] = None) -> ConditionalProof:
         """Agent creates a signed conditional commitment.
@@ -430,6 +432,7 @@ class Identity:
               'agent_key':self.public_key,'action':action,'resource':resource,
               'condition':condition,'valid_after':valid_after,
               'valid_until':valid_until_ms,'paired_with':paired_with,
+              'pair_id':pair_id,
               'timestamp':now,'nonce':nonce,'protocol':PROTOCOL,
               'kind':'conditional_proof'}
         ch = _challenge(cd); sig = _sign(self._priv.hex, bytes.fromhex(ch))
@@ -440,6 +443,7 @@ class Identity:
             agent_key=self.public_key, action=action, resource=resource,
             condition=condition, valid_after=valid_after,
             valid_until=valid_until_ms, paired_with=paired_with,
+            pair_id=pair_id,
             timestamp=now, nonce=nonce, challenge=ch, signature=sig)
 
     def store(self, cred): self._creds[cred.credential_id]=cred
@@ -453,6 +457,8 @@ class Verifier:
         self._creds: Dict[str,Credential]={}; self._nonces: Dict[str,int]={}
         self._log: List[Dict]=[]; self._ttl=ttl
         self._last_heartbeat: Dict[str,int]={}
+        self._settle_lock = threading.Lock()
+        self._settled_pairs: Dict[str,int]={}  # pair_key → ms timestamp
     def register_credential(self, cred):
         self._creds[cred.credential_id]=cred
         if cred.heartbeat_interval_ms is not None:
@@ -483,6 +489,80 @@ class Verifier:
         self._log.append({'valid':True,'kind':'heartbeat','credential_id':proof.credential_id,
                            'agent_key':proof.agent_key,'timestamp':now})
         return {'valid':True,'kind':'heartbeat','credential_id':proof.credential_id}
+
+    def settle_pair(self, proof_a: 'ConditionalProof', proof_b: 'ConditionalProof',
+                    cred_a=None, cred_b=None) -> Dict:
+        """Atomically settle two paired ConditionalProofs."""
+        # Standalone verification of each proof first, outside the lock.
+        ra = self.verify_proposal(proof_a, cred_a)
+        if not ra.get('valid'):
+            return {'valid':False,'reason':f'proof_a_invalid:{ra.get("reason")}'}
+        rb = self.verify_proposal(proof_b, cred_b)
+        if not rb.get('valid'):
+            return {'valid':False,'reason':f'proof_b_invalid:{rb.get("reason")}'}
+
+        # Pairing structure checks
+        if proof_a.proof_id == proof_b.proof_id:
+            return {'valid':False,'reason':'self_pairing_denied'}
+        if proof_a.agent_key == proof_b.agent_key:
+            return {'valid':False,'reason':'same_agent_pair_denied'}
+        if proof_a.pair_id is None or proof_b.pair_id is None:
+            return {'valid':False,'reason':'missing_pair_id'}
+        if proof_a.pair_id != proof_b.pair_id:
+            return {'valid':False,'reason':'pair_id_mismatch'}
+
+        # Conditions must both be counterparty_proof referencing each other's credential
+        if proof_a.condition.get('type') != 'counterparty_proof':
+            return {'valid':False,'reason':'proof_a_condition_not_counterparty'}
+        if proof_b.condition.get('type') != 'counterparty_proof':
+            return {'valid':False,'reason':'proof_b_condition_not_counterparty'}
+        if proof_a.condition.get('credential_id') != proof_b.credential_id:
+            return {'valid':False,'reason':'proof_a_condition_wrong_credential'}
+        if proof_b.condition.get('credential_id') != proof_a.credential_id:
+            return {'valid':False,'reason':'proof_b_condition_wrong_credential'}
+
+        # Time window overlap
+        now = int(time.time() * 1000)
+        window_start = max(proof_a.valid_after, proof_b.valid_after)
+        window_end = min(proof_a.valid_until, proof_b.valid_until)
+        if window_start > window_end:
+            return {'valid':False,'reason':'window_no_overlap'}
+        if now < window_start:
+            return {'valid':False,'reason':f'window_not_yet:{now}<{window_start}'}
+        if now > window_end:
+            return {'valid':False,'reason':f'window_expired:{now}>{window_end}'}
+
+        pair_key = ':'.join(sorted([proof_a.proof_id, proof_b.proof_id]))
+        nk_a = f'cp:{proof_a.agent_key}:{proof_a.nonce}'
+        nk_b = f'cp:{proof_b.agent_key}:{proof_b.nonce}'
+
+        # CRITICAL SECTION: nonce check + consume + pair record, all-or-nothing
+        with self._settle_lock:
+            if pair_key in self._settled_pairs:
+                return {'valid':False,'reason':'pair_already_settled'}
+            if nk_a in self._nonces:
+                return {'valid':False,'reason':'proof_a_nonce_already_used'}
+            if nk_b in self._nonces:
+                return {'valid':False,'reason':'proof_b_nonce_already_used'}
+            self._nonces[nk_a] = now
+            self._nonces[nk_b] = now
+            self._settled_pairs[pair_key] = now
+
+        settlement = {'valid':True,'kind':'settlement','pair_key':pair_key,
+                      'settled_at':now,
+                      'party_a':{'agent_key':proof_a.agent_key,
+                                  'credential_id':proof_a.credential_id,
+                                  'proof_id':proof_a.proof_id,
+                                  'action':proof_a.action,
+                                  'resource':proof_a.resource},
+                      'party_b':{'agent_key':proof_b.agent_key,
+                                  'credential_id':proof_b.credential_id,
+                                  'proof_id':proof_b.proof_id,
+                                  'action':proof_b.action,
+                                  'resource':proof_b.resource}}
+        self._log.append(settlement)
+        return settlement
+
     def verify_proposal(self, proof: 'ConditionalProof', credential=None) -> Dict:
         """Verify a ConditionalProof as a standalone signed commitment.
 
@@ -539,7 +619,9 @@ class Verifier:
               'agent_key':proof.agent_key,'action':proof.action,
               'resource':proof.resource,'condition':proof.condition,
               'valid_after':proof.valid_after,'valid_until':proof.valid_until,
-              'paired_with':proof.paired_with,'timestamp':proof.timestamp,
+              'paired_with':proof.paired_with,
+              'pair_id':proof.pair_id,
+              'timestamp':proof.timestamp,
               'nonce':proof.nonce,'protocol':proof.protocol,
               'kind':'conditional_proof'}
         if not _seq(_challenge(cd), proof.challenge):
@@ -924,14 +1006,19 @@ class Acreo:
     def accept_heartbeat(self, proof, cred=None):
         return self._verifier.accept_heartbeat(proof, cred)
     def propose(self, agent, cred, action, resource, condition,
-                valid_until_ms, paired_with=None, valid_after_ms=None):
+                valid_until_ms, pair_id=None, paired_with=None,
+                valid_after_ms=None):
         """Convenience: agent creates a ConditionalProof."""
         return agent.propose(cred, action, resource, condition,
-                              valid_until_ms, paired_with=paired_with,
+                              valid_until_ms, pair_id=pair_id,
+                              paired_with=paired_with,
                               valid_after_ms=valid_after_ms)
     def verify_proposal(self, proof, cred=None):
         """Convenience: verify a standalone ConditionalProof."""
         return self._verifier.verify_proposal(proof, cred)
+    def settle_pair(self, proof_a, proof_b, cred_a=None, cred_b=None):
+        """Atomically settle two paired ConditionalProofs."""
+        return self._verifier.settle_pair(proof_a, proof_b, cred_a, cred_b)
     def create_mandated_agent(self, label, budget_usd=10.0, **kw):
         return MandatedAgent.create(label, budget_usd, **kw)
     def registry_stats(self): return self._registry.stats()

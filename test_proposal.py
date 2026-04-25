@@ -99,9 +99,9 @@ def main():
             action='execute',
             resource='polymarket/btc-100k-2026',
             condition={'type': 'counterparty_proof',
-                       'credential_id': 'placeholder',
-                       'proof_id': 'placeholder'},
+                       'credential_id': 'placeholder'},
             valid_until_ms=int(time.time() * 1000) + 60_000,
+            pair_id='alice-bob-session-001',
             paired_with='placeholder-proof-id',
         )
     except Exception as e:
@@ -113,6 +113,8 @@ def main():
                         lambda: r2.get('valid') is True))
     results.append(test("paired_with field preserved",
                         lambda: cp.paired_with == 'placeholder-proof-id'))
+    results.append(test("pair_id field preserved",
+                        lambda: cp.pair_id == 'alice-bob-session-001'))
 
     # 4. Existing primitives still work (smoke test for regression)
     ap = a.authorize(agent, cred, 'transact', 'polymarket/btc-100k-2026')
