@@ -265,6 +265,7 @@ class Credential:
     issued_at: int; expires_at: int
     max_uses: Optional[int]; spend_limit: Optional[float]
     metadata: Dict; signature: str; protocol: str = PROTOCOL
+    heartbeat_interval_ms: Optional[int] = None
     def valid(self) -> bool: return int(time.time()*1000) < self.expires_at
     def has(self, p: str) -> bool: return p in self.permissions
     def in_scope(self, r: str) -> bool:
@@ -292,6 +293,17 @@ class ActionProof:
     @classmethod
     def from_dict(cls, d): return cls(**{k:v for k,v in d.items() if k in cls.__dataclass_fields__})
 
+@dataclass
+class HeartbeatProof:
+    proof_id: str; credential_id: str; agent_key: str
+    timestamp: int; nonce: str; challenge: str; signature: str
+    protocol: str = PROTOCOL
+    def to_dict(self): return asdict(self)
+    def to_json(self): return json.dumps(self.to_dict(), indent=2)
+    @classmethod
+    def from_dict(cls, d): return cls(**{k:v for k,v in d.items() if k in cls.__dataclass_fields__})
+
+
 class Identity:
     """Cryptographic identity — user or AI agent."""
     def __init__(self, priv, pub, kind='agent', label=''):
@@ -308,7 +320,8 @@ class Identity:
         p,q=_keypair(); return cls(p,q,'agent',label)
     def delegate(self, agent_key: str, permissions: List[str],
                  scope=None, ttl_hours=24.0, max_uses=None,
-                 spend_limit=None, metadata=None) -> Credential:
+                 spend_limit=None, metadata=None,
+                 heartbeat_interval_ms: Optional[int] = None) -> Credential:
         if self.kind != 'user': raise CredentialError("Only users can delegate")
         Permission.validate(permissions)
         now=int(time.time()*1000); cid=Entropy.hex(16); salt=Entropy.hex(16)
@@ -317,14 +330,16 @@ class Identity:
         payload = {'credential_id':cid,'agent_key':agent_key,'user_commitment':commitment,
                    'permissions':sorted(permissions),'scope':sorted(scope or ['*']),
                    'issued_at':now,'expires_at':now+int(ttl_hours*3600000),
-                   'max_uses':max_uses,'spend_limit':spend_limit,'protocol':PROTOCOL}
+                   'max_uses':max_uses,'spend_limit':spend_limit,'protocol':PROTOCOL,
+                   'heartbeat_interval_ms':heartbeat_interval_ms}
         sig = _sign(self._priv.hex, bytes.fromhex(_challenge(payload)))
         meta = metadata or {}
         meta['issuer_pub'] = self.public_key
         return Credential(credential_id=cid,agent_key=agent_key,user_commitment=commitment,
                           permissions=sorted(permissions),scope=sorted(scope or ['*']),
                           issued_at=now,expires_at=now+int(ttl_hours*3600000),
-                          max_uses=max_uses,spend_limit=spend_limit,metadata=meta,signature=sig)
+                          max_uses=max_uses,spend_limit=spend_limit,metadata=meta,signature=sig,
+                          heartbeat_interval_ms=heartbeat_interval_ms)
     def prove_authorization(self, cred: Credential, action: str,
                              resource='*', context=None) -> ActionProof:
         if self.kind != 'agent': raise AcreoError("Only agents generate proofs")
@@ -341,6 +356,21 @@ class Identity:
         return ActionProof(proof_id=pid,credential_id=cred.credential_id,agent_key=self.public_key,
                            action=action,resource=resource,challenge=ch,signature=sig,
                            timestamp=now,nonce=nonce,context=context or {})
+    def prove_heartbeat(self, cred: Credential) -> HeartbeatProof:
+        """Agent produces a signed heartbeat proving it's alive and uncompromised."""
+        if self.kind != 'agent': raise AcreoError("Only agents produce heartbeats")
+        if cred.agent_key != self.public_key: raise CredentialError("Credential not for this agent")
+        if not cred.valid(): raise ExpiredError("Credential expired")
+        if cred.credential_id in self._revoked: raise CredentialError("Credential revoked")
+        now=int(time.time()*1000); nonce=Entropy.hex(16); pid=Entropy.hex(16)
+        cd={'proof_id':pid,'credential_id':cred.credential_id,'agent_key':self.public_key,
+            'timestamp':now,'nonce':nonce,'protocol':PROTOCOL,'kind':'heartbeat'}
+        ch=_challenge(cd); sig=_sign(self._priv.hex,bytes.fromhex(ch))
+        self._log.append({'action':'heartbeat','proof_id':pid,'timestamp':now})
+        return HeartbeatProof(proof_id=pid,credential_id=cred.credential_id,
+                               agent_key=self.public_key,timestamp=now,nonce=nonce,
+                               challenge=ch,signature=sig)
+
     def store(self, cred): self._creds[cred.credential_id]=cred
     def get_valid_credentials(self): return [c for c in self._creds.values() if c.valid()]
     def revoke(self, cid): self._revoked.add(cid)
@@ -351,8 +381,40 @@ class Verifier:
     def __init__(self, ttl=PROOF_TTL_MS):
         self._creds: Dict[str,Credential]={}; self._nonces: Dict[str,int]={}
         self._log: List[Dict]=[]; self._ttl=ttl
-    def register_credential(self, cred): self._creds[cred.credential_id]=cred
+        self._last_heartbeat: Dict[str,int]={}
+    def register_credential(self, cred):
+        self._creds[cred.credential_id]=cred
+        if cred.heartbeat_interval_ms is not None:
+            self._last_heartbeat[cred.credential_id] = cred.issued_at
+    def accept_heartbeat(self, proof, credential=None) -> Dict:
+        """Process a signed heartbeat. Resets the liveness timer if valid."""
+        if proof is None:
+            return {'valid':False,'reason':'heartbeat_proof_is_none'}
+        now=int(time.time()*1000); age=now-proof.timestamp
+        if age > self._ttl: return {'valid':False,'reason':f'heartbeat_expired:{age}ms'}
+        if proof.timestamp > now+60000: return {'valid':False,'reason':'heartbeat_future_timestamp'}
+        nk=f"hb:{proof.agent_key}:{proof.nonce}"
+        if nk in self._nonces: return {'valid':False,'reason':'heartbeat_replay_detected'}
+        c=credential or self._creds.get(proof.credential_id)
+        if not c: return {'valid':False,'reason':'heartbeat_credential_not_found'}
+        if not c.valid(): return {'valid':False,'reason':'heartbeat_credential_expired'}
+        if not _seq(proof.agent_key,c.agent_key):
+            return {'valid':False,'reason':'heartbeat_agent_key_mismatch'}
+        cd={'proof_id':proof.proof_id,'credential_id':proof.credential_id,
+            'agent_key':proof.agent_key,'timestamp':proof.timestamp,'nonce':proof.nonce,
+            'protocol':proof.protocol,'kind':'heartbeat'}
+        if not _seq(_challenge(cd),proof.challenge):
+            return {'valid':False,'reason':'heartbeat_challenge_mismatch'}
+        if not _verify(proof.agent_key,bytes.fromhex(proof.challenge),proof.signature):
+            return {'valid':False,'reason':'heartbeat_signature_invalid'}
+        self._nonces[nk]=now
+        self._last_heartbeat[proof.credential_id]=now
+        self._log.append({'valid':True,'kind':'heartbeat','credential_id':proof.credential_id,
+                           'agent_key':proof.agent_key,'timestamp':now})
+        return {'valid':True,'kind':'heartbeat','credential_id':proof.credential_id}
     def verify(self, proof: ActionProof, credential=None) -> Dict:
+        if proof is None:
+            return {'valid':False,'reason':'proof_is_none'}
         def fail(r):
             self._log.append({'valid':False,'reason':r,'action':getattr(proof,'action','?'),
                                'timestamp':int(time.time()*1000)})
@@ -377,10 +439,15 @@ class Verifier:
                         'user_commitment':c.user_commitment,
                         'permissions':sorted(c.permissions),'scope':sorted(c.scope),
                         'issued_at':c.issued_at,'expires_at':c.expires_at,
-                        'max_uses':c.max_uses,'spend_limit':c.spend_limit,'protocol':PROTOCOL}
+                        'max_uses':c.max_uses,'spend_limit':c.spend_limit,'protocol':PROTOCOL,
+                        'heartbeat_interval_ms':c.heartbeat_interval_ms}
         cred_challenge = _challenge(cred_payload)
         if not _verify(issuer_pub, bytes.fromhex(cred_challenge), c.signature):
             return fail('credential_signature_invalid')
+        if c.heartbeat_interval_ms is not None:
+            last_hb = self._last_heartbeat.get(c.credential_id, c.issued_at)
+            if now - last_hb > c.heartbeat_interval_ms:
+                return fail(f'heartbeat_overdue:{now - last_hb}ms>{c.heartbeat_interval_ms}ms')
         if not c.has(proof.action): return fail(f'permission_denied:{proof.action}')
         if proof.resource!='*' and not c.in_scope(proof.resource): return fail(f'out_of_scope')
         cd={'proof_id':proof.proof_id,'credential_id':proof.credential_id,'agent_key':proof.agent_key,
@@ -445,6 +512,9 @@ class AgentWallet:
         self._balance+=amount; self._record('fund',amount,'fund','wallet','complete')
         return PaymentReceipt(True,Entropy.hex(8),amount,self._balance,'fund')
     def _charge(self, amount, tx_type, action, resource):
+        if amount<=0:
+            tx=self._record(tx_type,amount,action,resource,'declined',{'reason':'invalid_amount'})
+            return PaymentReceipt(False,tx.tx_id,amount,self._balance,action,'invalid_amount')
         if time.time()>self._day_reset: self._day_spend=0.0; self._day_reset=int(time.time())+86400
         if amount>self._balance:
             tx=self._record(tx_type,amount,action,resource,'declined',{'reason':'insufficient_balance'})
@@ -501,6 +571,8 @@ class MandatedAgent:
                                    spend_limit_per_tx=spend_limit_per_tx)
         return cls(Entropy.hex(16),label,wallet,config)
     def act(self, action, resource='*', data=None, **kwargs) -> Dict:
+        if not action or not isinstance(action, str):
+            raise ValueError(f"action must be a non-empty string, got {action!r}")
         result={'allowed':False,'paid':False,'pii_found':{},'clean_data':data,'tx_id':None,'reason':None}
         if self._config.require_wallet:
             if not self.wallet or not self.wallet.is_funded:
@@ -703,6 +775,12 @@ class Acreo:
     def authorize(self, agent, cred, action, resource='*', **kw):
         return agent.prove_authorization(cred, action, resource, **kw)
     def verify_action(self, proof, cred=None): return self._verifier.verify(proof, cred)
+    def heartbeat(self, agent, cred):
+        """Agent produces heartbeat, verifier accepts it. Returns verdict dict."""
+        proof = agent.prove_heartbeat(cred)
+        return self._verifier.accept_heartbeat(proof, cred)
+    def accept_heartbeat(self, proof, cred=None):
+        return self._verifier.accept_heartbeat(proof, cred)
     def create_mandated_agent(self, label, budget_usd=10.0, **kw):
         return MandatedAgent.create(label, budget_usd, **kw)
     def registry_stats(self): return self._registry.stats()
