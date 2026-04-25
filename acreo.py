@@ -304,6 +304,30 @@ class HeartbeatProof:
     def from_dict(cls, d): return cls(**{k:v for k,v in d.items() if k in cls.__dataclass_fields__})
 
 
+@dataclass
+class ConditionalProof:
+    """Signed conditional commitment from an agent.
+
+    Says: 'I will perform <action> on <resource> if <condition>
+    is met between <valid_after> and <valid_until>.'
+
+    Stage A: only standalone verification — no settlement yet.
+    Stage B will add settle_pair() to atomically settle two
+    matching ConditionalProofs.
+    """
+    proof_id: str; credential_id: str; agent_key: str
+    action: str; resource: str
+    condition: Dict          # {type:'counterparty_proof'|'always', ...}
+    valid_after: int; valid_until: int
+    paired_with: Optional[str]   # proof_id of counterparty's ConditionalProof
+    timestamp: int; nonce: str; challenge: str; signature: str
+    protocol: str = PROTOCOL
+    def to_dict(self): return asdict(self)
+    def to_json(self): return json.dumps(self.to_dict(), indent=2)
+    @classmethod
+    def from_dict(cls, d): return cls(**{k:v for k,v in d.items() if k in cls.__dataclass_fields__})
+
+
 class Identity:
     """Cryptographic identity — user or AI agent."""
     def __init__(self, priv, pub, kind='agent', label=''):
@@ -371,6 +395,53 @@ class Identity:
                                agent_key=self.public_key,timestamp=now,nonce=nonce,
                                challenge=ch,signature=sig)
 
+    def propose(self, cred: Credential, action: str, resource: str,
+                condition: Dict, valid_until_ms: int,
+                paired_with: Optional[str] = None,
+                valid_after_ms: Optional[int] = None) -> ConditionalProof:
+        """Agent creates a signed conditional commitment.
+
+        condition is a dict with at least a 'type' field.
+        Stage A supports: 'always', 'counterparty_proof'.
+        valid_until_ms is the unix-ms timestamp the commitment expires.
+        """
+        if self.kind != 'agent':
+            raise AcreoError("Only agents create proposals")
+        if cred.agent_key != self.public_key:
+            raise CredentialError("Credential not for this agent")
+        if not cred.valid():
+            raise ExpiredError("Credential expired")
+        if cred.credential_id in self._revoked:
+            raise CredentialError("Credential revoked")
+        if not cred.has(action):
+            raise PermissionDenied(f"No permission: {action}")
+        if resource != '*' and not cred.in_scope(resource):
+            raise CredentialError(f"Resource out of scope: {resource}")
+        if not isinstance(condition, dict) or 'type' not in condition:
+            raise ValueError("condition must be a dict with a 'type' field")
+        if condition['type'] not in ('always', 'counterparty_proof'):
+            raise ValueError(f"Unknown condition type: {condition['type']}")
+        now = int(time.time() * 1000)
+        if valid_until_ms <= now:
+            raise ValueError(f"valid_until_ms in the past: {valid_until_ms} <= {now}")
+        valid_after = valid_after_ms if valid_after_ms is not None else now
+        nonce = Entropy.hex(16); pid = Entropy.hex(16)
+        cd = {'proof_id':pid,'credential_id':cred.credential_id,
+              'agent_key':self.public_key,'action':action,'resource':resource,
+              'condition':condition,'valid_after':valid_after,
+              'valid_until':valid_until_ms,'paired_with':paired_with,
+              'timestamp':now,'nonce':nonce,'protocol':PROTOCOL,
+              'kind':'conditional_proof'}
+        ch = _challenge(cd); sig = _sign(self._priv.hex, bytes.fromhex(ch))
+        self._log.append({'kind':'propose','action':action,'resource':resource,
+                           'proof_id':pid,'timestamp':now})
+        return ConditionalProof(
+            proof_id=pid, credential_id=cred.credential_id,
+            agent_key=self.public_key, action=action, resource=resource,
+            condition=condition, valid_after=valid_after,
+            valid_until=valid_until_ms, paired_with=paired_with,
+            timestamp=now, nonce=nonce, challenge=ch, signature=sig)
+
     def store(self, cred): self._creds[cred.credential_id]=cred
     def get_valid_credentials(self): return [c for c in self._creds.values() if c.valid()]
     def revoke(self, cid): self._revoked.add(cid)
@@ -412,6 +483,77 @@ class Verifier:
         self._log.append({'valid':True,'kind':'heartbeat','credential_id':proof.credential_id,
                            'agent_key':proof.agent_key,'timestamp':now})
         return {'valid':True,'kind':'heartbeat','credential_id':proof.credential_id}
+    def verify_proposal(self, proof: 'ConditionalProof', credential=None) -> Dict:
+        """Verify a ConditionalProof as a standalone signed commitment.
+
+        Stage A: checks signature, expiration, scope, permission, condition shape.
+        Does NOT consume nonce — that happens at settlement (Stage B).
+        Does NOT check whether the condition is currently met — verifying that
+        the proposal is well-formed is a separate question from whether it binds.
+        """
+        def fail(r):
+            self._log.append({'valid':False,'kind':'proposal','reason':r,
+                               'timestamp':int(time.time()*1000)})
+            return {'valid':False,'reason':r}
+        if proof is None:
+            return {'valid':False,'reason':'proposal_proof_is_none'}
+        now = int(time.time() * 1000)
+        if now >= proof.valid_until:
+            return fail(f'proposal_expired:{now}>={proof.valid_until}')
+        if proof.timestamp > now + 60000:
+            return fail('proposal_future_timestamp')
+        if proof.valid_after > proof.valid_until:
+            return fail('proposal_invalid_window')
+        c = credential or self._creds.get(proof.credential_id)
+        if not c:
+            return fail('proposal_credential_not_found')
+        if not c.valid():
+            return fail('proposal_credential_expired')
+        if not _seq(proof.agent_key, c.agent_key):
+            return fail('proposal_agent_key_mismatch')
+        # Verify the credential's own signature (same logic as verify())
+        issuer_pub = c.metadata.get('issuer_pub') if c.metadata else None
+        if not issuer_pub:
+            return fail('proposal_credential_missing_issuer_pub')
+        cred_payload = {'credential_id':c.credential_id,'agent_key':c.agent_key,
+                        'user_commitment':c.user_commitment,
+                        'permissions':sorted(c.permissions),'scope':sorted(c.scope),
+                        'issued_at':c.issued_at,'expires_at':c.expires_at,
+                        'max_uses':c.max_uses,'spend_limit':c.spend_limit,
+                        'protocol':PROTOCOL,
+                        'heartbeat_interval_ms':c.heartbeat_interval_ms}
+        if not _verify(issuer_pub, bytes.fromhex(_challenge(cred_payload)), c.signature):
+            return fail('proposal_credential_signature_invalid')
+        # Permission and scope checks
+        if not c.has(proof.action):
+            return fail(f'proposal_permission_denied:{proof.action}')
+        if proof.resource != '*' and not c.in_scope(proof.resource):
+            return fail('proposal_out_of_scope')
+        # Condition shape
+        if not isinstance(proof.condition, dict) or 'type' not in proof.condition:
+            return fail('proposal_malformed_condition')
+        if proof.condition['type'] not in ('always', 'counterparty_proof'):
+            return fail(f'proposal_unknown_condition_type:{proof.condition["type"]}')
+        # Re-derive challenge and verify signature on the proposal itself
+        cd = {'proof_id':proof.proof_id,'credential_id':proof.credential_id,
+              'agent_key':proof.agent_key,'action':proof.action,
+              'resource':proof.resource,'condition':proof.condition,
+              'valid_after':proof.valid_after,'valid_until':proof.valid_until,
+              'paired_with':proof.paired_with,'timestamp':proof.timestamp,
+              'nonce':proof.nonce,'protocol':proof.protocol,
+              'kind':'conditional_proof'}
+        if not _seq(_challenge(cd), proof.challenge):
+            return fail('proposal_challenge_mismatch')
+        if not _verify(proof.agent_key, bytes.fromhex(proof.challenge), proof.signature):
+            return fail('proposal_signature_invalid')
+        result = {'valid':True,'kind':'proposal','proof_id':proof.proof_id,
+                  'credential_id':proof.credential_id,'agent_key':proof.agent_key,
+                  'action':proof.action,'resource':proof.resource,
+                  'condition':proof.condition,'paired_with':proof.paired_with,
+                  'valid_until':proof.valid_until}
+        self._log.append(result)
+        return result
+
     def verify(self, proof: ActionProof, credential=None) -> Dict:
         if proof is None:
             return {'valid':False,'reason':'proof_is_none'}
@@ -781,6 +923,15 @@ class Acreo:
         return self._verifier.accept_heartbeat(proof, cred)
     def accept_heartbeat(self, proof, cred=None):
         return self._verifier.accept_heartbeat(proof, cred)
+    def propose(self, agent, cred, action, resource, condition,
+                valid_until_ms, paired_with=None, valid_after_ms=None):
+        """Convenience: agent creates a ConditionalProof."""
+        return agent.propose(cred, action, resource, condition,
+                              valid_until_ms, paired_with=paired_with,
+                              valid_after_ms=valid_after_ms)
+    def verify_proposal(self, proof, cred=None):
+        """Convenience: verify a standalone ConditionalProof."""
+        return self._verifier.verify_proposal(proof, cred)
     def create_mandated_agent(self, label, budget_usd=10.0, **kw):
         return MandatedAgent.create(label, budget_usd, **kw)
     def registry_stats(self): return self._registry.stats()
