@@ -266,6 +266,7 @@ class Credential:
     max_uses: Optional[int]; spend_limit: Optional[float]
     metadata: Dict; signature: str; protocol: str = PROTOCOL
     heartbeat_interval_ms: Optional[int] = None
+    witness: Optional[str] = None  # for anonymous proofs (Stage C-3)
     def valid(self) -> bool: return int(time.time()*1000) < self.expires_at
     def has(self, p: str) -> bool: return p in self.permissions
     def in_scope(self, r: str) -> bool:
@@ -296,6 +297,27 @@ class ActionProof:
 @dataclass
 class HeartbeatProof:
     proof_id: str; credential_id: str; agent_key: str
+    timestamp: int; nonce: str; challenge: str; signature: str
+    protocol: str = PROTOCOL
+    def to_dict(self): return asdict(self)
+    def to_json(self): return json.dumps(self.to_dict(), indent=2)
+    @classmethod
+    def from_dict(cls, d): return cls(**{k:v for k,v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class OperatorReport:
+    """Signed record of bot activity, sealed to the operator.
+
+    Different from ActionProof in semantics: ActionProof says "I am about
+    to do X, please authorize." OperatorReport says "I did X, here's the
+    record for your audit log." No scope/permission check on verify; the
+    bot already performed the action. Verifier confirms signature only.
+
+    Always travels inside a sealed envelope — never sent in plaintext.
+    """
+    report_id: str; credential_id: str; agent_key: str
+    event_type: str; payload: Dict
     timestamp: int; nonce: str; challenge: str; signature: str
     protocol: str = PROTOCOL
     def to_dict(self): return asdict(self)
@@ -360,11 +382,16 @@ class Identity:
         sig = _sign(self._priv.hex, bytes.fromhex(_challenge(payload)))
         meta = metadata or {}
         meta['issuer_pub'] = self.public_key
+        # Witness for anonymous proofs (Stage C-3)
+        from acreo_anon import generate_witness as _gen_witness
+        witness = _gen_witness(self._priv.hex, cid, agent_key,
+                                ','.join(sorted(permissions)))
         return Credential(credential_id=cid,agent_key=agent_key,user_commitment=commitment,
                           permissions=sorted(permissions),scope=sorted(scope or ['*']),
                           issued_at=now,expires_at=now+int(ttl_hours*3600000),
                           max_uses=max_uses,spend_limit=spend_limit,metadata=meta,signature=sig,
-                          heartbeat_interval_ms=heartbeat_interval_ms)
+                          heartbeat_interval_ms=heartbeat_interval_ms,
+                          witness=witness)
     def prove_authorization(self, cred: Credential, action: str,
                              resource='*', context=None) -> ActionProof:
         if self.kind != 'agent': raise AcreoError("Only agents generate proofs")
@@ -506,6 +533,74 @@ class Identity:
         priv, _ = self._x25519_keypair()
         return SealedMessage.unseal(priv, sealed_blob)
 
+    def report(self, operator_peer_key: str, cred: 'Credential',
+               event_type: str, payload: Dict) -> str:
+        """Bot creates a signed report and seals it to its operator.
+
+        Returns a sealed blob. The operator decrypts with receive_report,
+        then verifies the inner OperatorReport with the verifier.
+        """
+        if self.kind != 'agent':
+            raise AcreoError("only agents send operator reports")
+        if cred.agent_key != self.public_key:
+            raise CredentialError("credential not for this agent")
+        if not cred.valid():
+            raise ExpiredError("credential expired")
+        if cred.credential_id in self._revoked:
+            raise CredentialError("credential revoked")
+        if not isinstance(event_type, str) or not event_type:
+            raise ValueError("event_type must be a non-empty string")
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        now = int(time.time() * 1000)
+        nonce = Entropy.hex(16); rid = Entropy.hex(16)
+        cd = {'report_id':rid,'credential_id':cred.credential_id,
+              'agent_key':self.public_key,'event_type':event_type,
+              'payload':payload,'timestamp':now,'nonce':nonce,
+              'protocol':PROTOCOL,'kind':'operator_report'}
+        ch = _challenge(cd)
+        sig = _sign(self._priv.hex, bytes.fromhex(ch))
+        report = OperatorReport(
+            report_id=rid, credential_id=cred.credential_id,
+            agent_key=self.public_key, event_type=event_type,
+            payload=payload, timestamp=now, nonce=nonce,
+            challenge=ch, signature=sig)
+        # Serialize and seal to operator
+        from acreo_sealed import SealedMessage
+        return SealedMessage.seal(operator_peer_key, report.to_json().encode())
+
+    def receive_report(self, sealed_blob: str) -> 'OperatorReport':
+        """Operator unseals a report. Still needs verifier check."""
+        if self.kind not in ('user', 'agent'):
+            raise AcreoError("only user/agent identities can receive reports")
+        from acreo_sealed import SealedMessage
+        priv, _ = self._x25519_keypair()
+        plaintext = SealedMessage.unseal(priv, sealed_blob)
+        d = json.loads(plaintext.decode())
+        return OperatorReport.from_dict(d)
+
+    def prove_anonymous(self, cred: 'Credential', claim: str):
+        """Generate a pseudonymous proof of credential possession.
+
+        External observers cannot link two proofs from the same credential.
+        The operator who issued the credential CAN correlate (v0.1 limitation).
+        """
+        if self.kind != 'agent':
+            raise AcreoError("only agents create anonymous proofs")
+        if cred.agent_key != self.public_key:
+            raise CredentialError("credential not for this agent")
+        if not cred.valid():
+            raise ExpiredError("credential expired")
+        if cred.credential_id in self._revoked:
+            raise CredentialError("credential revoked")
+        if cred.witness is None:
+            raise CredentialError("credential has no witness — not eligible")
+        from acreo_anon import prove_anonymous as _prove_anon
+        operator_pub = cred.metadata.get('issuer_pub') if cred.metadata else None
+        if not operator_pub:
+            raise CredentialError("credential missing issuer_pub")
+        return _prove_anon(cred.witness, claim, operator_pub)
+
     def store(self, cred): self._creds[cred.credential_id]=cred
     def get_valid_credentials(self): return [c for c in self._creds.values() if c.valid()]
     def revoke(self, cid): self._revoked.add(cid)
@@ -521,6 +616,10 @@ class Verifier:
         self._settled_pairs: Dict[str,int]={}  # pair_key → ms timestamp
     def register_credential(self, cred):
         self._creds[cred.credential_id]=cred
+        if cred.witness is not None:
+            if not hasattr(self, '_witnesses'):
+                self._witnesses = {}
+            self._witnesses[cred.credential_id] = cred.witness
         if cred.heartbeat_interval_ms is not None:
             self._last_heartbeat[cred.credential_id] = cred.issued_at
     def accept_heartbeat(self, proof, credential=None) -> Dict:
@@ -549,6 +648,95 @@ class Verifier:
         self._log.append({'valid':True,'kind':'heartbeat','credential_id':proof.credential_id,
                            'agent_key':proof.agent_key,'timestamp':now})
         return {'valid':True,'kind':'heartbeat','credential_id':proof.credential_id}
+
+    def verify_anonymous(self, proof, claim: Optional[str] = None) -> Dict:
+        """Verify a pseudonymous credential proof.
+
+        Iterates over registered witnesses to find which credential issued
+        the proof. The matched credential_id is returned (operator-side
+        linkability is the v0.1 known limitation).
+        """
+        def fail(r):
+            self._log.append({'valid':False,'kind':'anonymous','reason':r,
+                               'timestamp':int(time.time()*1000)})
+            return {'valid':False,'reason':r}
+        if proof is None:
+            return {'valid':False,'reason':'proof_is_none'}
+        if claim is not None and proof.claim != claim:
+            return fail(f'claim_mismatch:expected={claim}:got={proof.claim}')
+        nk = f'anon:{proof.pseudonym}'
+        if nk in self._nonces:
+            return fail('anonymous_replay_detected')
+        witnesses = list(getattr(self, '_witnesses', {}).values())
+        if not witnesses:
+            return fail('no_witnesses_registered')
+        from acreo_anon import verify_anonymous as _verify_anon
+        result = _verify_anon(proof, witnesses)
+        if not result.get('valid'):
+            return fail(f'anonymous:{result.get("reason", "unknown")}')
+        matched_witness = result.get('matched_witness')
+        matched_cred_id = None
+        for cid, w in getattr(self, '_witnesses', {}).items():
+            if w == matched_witness:
+                matched_cred_id = cid
+                break
+        if matched_cred_id is None:
+            return fail('witness_match_but_no_credential')
+        cred = self._creds.get(matched_cred_id)
+        if cred and not cred.valid():
+            return fail('matched_credential_expired')
+        self._nonces[nk] = int(time.time() * 1000)
+        out = {'valid':True,'kind':'anonymous',
+               'matched_credential_id':matched_cred_id,
+               'pseudonym':proof.pseudonym,
+               'claim':proof.claim,
+               'timestamp':proof.timestamp}
+        self._log.append(out)
+        return out
+
+    def verify_report(self, report: 'OperatorReport', credential=None) -> Dict:
+        """Verify an operator report's signature and record it in the log.
+
+        Different from verify(): no scope or permission check. The bot
+        already did the action; this just confirms the report is authentic
+        and logs it. Replay protection via nonce store, same as ActionProof.
+        """
+        def fail(r):
+            self._log.append({'valid':False,'kind':'report','reason':r,
+                               'timestamp':int(time.time()*1000)})
+            return {'valid':False,'reason':r}
+        if report is None:
+            return {'valid':False,'reason':'report_is_none'}
+        c = credential or self._creds.get(report.credential_id)
+        if not c:
+            return fail('report_credential_not_found')
+        if not c.valid():
+            return fail('report_credential_expired')
+        if not _seq(report.agent_key, c.agent_key):
+            return fail('report_agent_key_mismatch')
+        # Anti-replay
+        nk = f'rpt:{report.agent_key}:{report.nonce}'
+        if nk in self._nonces:
+            return fail('report_replay_detected')
+        # Re-derive challenge and verify signature
+        cd = {'report_id':report.report_id,'credential_id':report.credential_id,
+              'agent_key':report.agent_key,'event_type':report.event_type,
+              'payload':report.payload,'timestamp':report.timestamp,
+              'nonce':report.nonce,'protocol':report.protocol,
+              'kind':'operator_report'}
+        if not _seq(_challenge(cd), report.challenge):
+            return fail('report_challenge_mismatch')
+        if not _verify(report.agent_key, bytes.fromhex(report.challenge),
+                       report.signature):
+            return fail('report_signature_invalid')
+        self._nonces[nk] = report.timestamp
+        result = {'valid':True,'kind':'report','report_id':report.report_id,
+                  'credential_id':report.credential_id,
+                  'agent_key':report.agent_key,
+                  'event_type':report.event_type,
+                  'timestamp':report.timestamp}
+        self._log.append(result)
+        return result
 
     def settle_pair(self, proof_a: 'ConditionalProof', proof_b: 'ConditionalProof',
                     cred_a=None, cred_b=None) -> Dict:
@@ -1079,6 +1267,21 @@ class Acreo:
     def settle_pair(self, proof_a, proof_b, cred_a=None, cred_b=None):
         """Atomically settle two paired ConditionalProofs."""
         return self._verifier.settle_pair(proof_a, proof_b, cred_a, cred_b)
+    def report(self, agent, cred, operator_peer_key, event_type, payload):
+        """Convenience: bot creates and seals a report to operator."""
+        return agent.report(operator_peer_key, cred, event_type, payload)
+    def receive_report(self, identity, sealed_blob):
+        """Convenience: operator unseals a report."""
+        return identity.receive_report(sealed_blob)
+    def verify_report(self, report, cred=None):
+        """Convenience: verify a report's signature."""
+        return self._verifier.verify_report(report, cred)
+    def prove_anonymous(self, agent, cred, claim):
+        """Convenience: agent generates a pseudonymous proof."""
+        return agent.prove_anonymous(cred, claim)
+    def verify_anonymous(self, proof, claim=None):
+        """Convenience: verify a pseudonymous proof."""
+        return self._verifier.verify_anonymous(proof, claim)
     def create_mandated_agent(self, label, budget_usd=10.0, **kw):
         return MandatedAgent.create(label, budget_usd, **kw)
     def registry_stats(self): return self._registry.stats()
