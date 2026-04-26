@@ -1,0 +1,91 @@
+{
+  "total": 10,
+  "summary": {
+    "PASS": 10,
+    "FAIL": 0,
+    "SKIP": 0,
+    "ERROR": 0
+  },
+  "results": [
+    {
+      "family": "settle",
+      "name": "happy_path",
+      "claim": "A well-formed matched pair settles successfully",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "settled, pair_key=01e87a402b89d4b32d494213..."
+    },
+    {
+      "family": "settle",
+      "name": "replay_settled_pair",
+      "claim": "A pair that has been settled cannot be settled again",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "replay blocked: pair_already_settled"
+    },
+    {
+      "family": "settle",
+      "name": "replay_swapped_order",
+      "claim": "Settling (b, a) after (a, b) must also be blocked",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "blocked: pair_already_settled"
+    },
+    {
+      "family": "settle",
+      "name": "mismatched_pair_id",
+      "claim": "Pair where pair_id values differ must be rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: pair_id_mismatch"
+    },
+    {
+      "family": "settle",
+      "name": "self_pairing",
+      "claim": "A proof paired with itself must be rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: self_pairing_denied"
+    },
+    {
+      "family": "settle",
+      "name": "tampered_pair_id",
+      "claim": "Mutating .pair_id after signing must invalidate the proof",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: proof_a_invalid:proposal_challenge_mismatch"
+    },
+    {
+      "family": "settle",
+      "name": "expired_pair",
+      "claim": "A pair whose window ended before settlement must be rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: proof_a_invalid:proposal_expired:1777247671586>=1777247671085"
+    },
+    {
+      "family": "settle",
+      "name": "signature_stripped",
+      "claim": "Pair where one proof's signature has been zeroed must be rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: proof_b_invalid:proposal_signature_invalid"
+    },
+    {
+      "family": "settle",
+      "name": "concurrent_settlement_race",
+      "claim": "Concurrent settlements of the same pair must result in exactly one acceptance",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "exactly 1/20 accepted"
+    },
+    {
+      "family": "settle",
+      "name": "tampered_window_extension",
+      "claim": "Extending valid_until past the signed value must be rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: proof_a_invalid:proposal_expired:1777247672622>=1777247672121"
+    }
+  ]
+}

@@ -1,0 +1,91 @@
+{
+  "total": 10,
+  "summary": {
+    "PASS": 10,
+    "FAIL": 0,
+    "SKIP": 0,
+    "ERROR": 0
+  },
+  "results": [
+    {
+      "family": "anon",
+      "name": "happy_path",
+      "claim": "Bot generates anonymous proof, verifier accepts and identifies cred",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "matched cred=b5af1d431321a6e0..."
+    },
+    {
+      "family": "anon",
+      "name": "external_unlinkability",
+      "claim": "Two proofs from same credential have no shared public fields",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "all four public fields differ"
+    },
+    {
+      "family": "anon",
+      "name": "operator_can_correlate",
+      "claim": "v0.1 KNOWN: operator can match both proofs to same credential",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "matched correctly (this is the v0.5 issue)"
+    },
+    {
+      "family": "anon",
+      "name": "replay_blocked",
+      "claim": "Same proof verified twice must be blocked on second use",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "replay rejected: anonymous_replay_detected"
+    },
+    {
+      "family": "anon",
+      "name": "no_witness_for_other_operator",
+      "claim": "Proof made with operator A's witness doesn't verify against operator B's verifier",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: anonymous:no_matching_witness"
+    },
+    {
+      "family": "anon",
+      "name": "tampered_pseudonym",
+      "claim": "Mutating proof.pseudonym after generation must fail verification",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: anonymous:challenge_mismatch"
+    },
+    {
+      "family": "anon",
+      "name": "revoked_credential_blocked",
+      "claim": "Bot whose credential is revoked cannot generate new anonymous proofs",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "CredentialError raised"
+    },
+    {
+      "family": "anon",
+      "name": "expired_credential_blocked_at_prove",
+      "claim": "Expired credential cannot generate new anonymous proofs",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "ExpiredError raised at prove time"
+    },
+    {
+      "family": "anon",
+      "name": "non_agent_blocked",
+      "claim": "Users (non-agents) cannot generate anonymous proofs",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "raised as expected"
+    },
+    {
+      "family": "anon",
+      "name": "claim_filter_works",
+      "claim": "verify_anonymous with claim filter rejects proofs for different claims",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: claim_mismatch:expected=different_claim:got=transact"
+    }
+  ]
+}

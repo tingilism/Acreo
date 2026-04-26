@@ -1,0 +1,75 @@
+{
+  "total": 8,
+  "summary": {
+    "PASS": 8,
+    "FAIL": 0,
+    "SKIP": 0,
+    "ERROR": 0
+  },
+  "results": [
+    {
+      "family": "report",
+      "name": "happy_path",
+      "claim": "Bot reports, operator unseals, verifier accepts",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "event_type=trade_executed"
+    },
+    {
+      "family": "report",
+      "name": "wrong_operator_cannot_decrypt",
+      "claim": "Sealed report cannot be decrypted by anyone except intended operator",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "decryption rejected as expected"
+    },
+    {
+      "family": "report",
+      "name": "tampered_payload",
+      "claim": "Modifying report.payload after signing must fail verification",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: report_challenge_mismatch"
+    },
+    {
+      "family": "report",
+      "name": "forged_sender_signature",
+      "claim": "Report signed by a different agent's key must be rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: report_challenge_mismatch"
+    },
+    {
+      "family": "report",
+      "name": "replay_blocked",
+      "claim": "Same report verified twice must be blocked on second use",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "replay rejected: report_replay_detected"
+    },
+    {
+      "family": "report",
+      "name": "expired_credential",
+      "claim": "Report from an expired credential must be rejected at verify time",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: report_credential_expired"
+    },
+    {
+      "family": "report",
+      "name": "revoked_credential",
+      "claim": "Bot whose credential is revoked cannot create new reports",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "raised: CredentialError: credential revoked"
+    },
+    {
+      "family": "report",
+      "name": "non_agent_cannot_report",
+      "claim": "Users (non-agents) cannot create reports \u2014 only agents can",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "AcreoError raised as expected"
+    }
+  ]
+}

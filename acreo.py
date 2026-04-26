@@ -37,6 +37,7 @@ from dataclasses import dataclass, field, asdict
 from functools import wraps
 from enum import Enum
 from collections import defaultdict
+from dilithium_py.ml_dsa import ML_DSA_65
 
 VERSION          = "1.0.0"
 PROTOCOL         = "acreo-v1"
@@ -108,6 +109,58 @@ def _keypair() -> Tuple[str, str]:
     return (priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
                                 serialization.NoEncryption()).hex(),
             pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex())
+
+# ─── Crypto suite identifiers (Stage D-1a) ──────────────────
+CRYPTO_SUITE_ED25519 = 'ed25519'
+CRYPTO_SUITE_ML_DSA_65 = 'ml-dsa-65'
+SUPPORTED_CRYPTO_SUITES = (CRYPTO_SUITE_ED25519, CRYPTO_SUITE_ML_DSA_65)
+
+
+def _sign_pq(priv_bytes: bytes, msg: bytes) -> bytes:
+    """ML-DSA-65 signing.
+
+    Note: this dilithium_py implementation is educational-grade and not
+    constant-time. Suitable for research and prototyping. Production use
+    requires a constant-time implementation. See README for details.
+    """
+    return ML_DSA_65.sign(priv_bytes, msg)
+
+
+def _verify_pq(pub_bytes: bytes, msg: bytes, sig_bytes: bytes) -> bool:
+    """ML-DSA-65 verification."""
+    try:
+        return ML_DSA_65.verify(pub_bytes, msg, sig_bytes)
+    except Exception:
+        return False
+
+
+def _sign_with(suite: str, priv, msg: bytes):
+    """Dispatch signing by crypto suite.
+
+    For ED25519: priv is hex string, returns hex string.
+    For ML_DSA_65: priv is raw bytes, returns raw bytes.
+    """
+    if suite == CRYPTO_SUITE_ED25519:
+        return _sign(priv, msg)
+    elif suite == CRYPTO_SUITE_ML_DSA_65:
+        return _sign_pq(priv, msg)
+    else:
+        raise ValueError(f'unsupported crypto suite: {suite}')
+
+
+def _verify_with(suite: str, pub, msg: bytes, sig) -> bool:
+    """Dispatch verification by crypto suite.
+
+    For ED25519: pub is hex, sig is hex.
+    For ML_DSA_65: pub is bytes, sig is bytes.
+    """
+    if suite == CRYPTO_SUITE_ED25519:
+        return _verify(pub, msg, sig)
+    elif suite == CRYPTO_SUITE_ML_DSA_65:
+        return _verify_pq(pub, msg, sig)
+    else:
+        return False
+
 
 def _sign(priv_hex: str, msg: bytes) -> str:
     with ProtectedKey(bytes.fromhex(priv_hex)) as pb:
@@ -267,6 +320,7 @@ class Credential:
     metadata: Dict; signature: str; protocol: str = PROTOCOL
     heartbeat_interval_ms: Optional[int] = None
     witness: Optional[str] = None  # for anonymous proofs (Stage C-3)
+    crypto_suite: str = 'ed25519'  # 'ed25519' or 'ml-dsa-65' (Stage D-1a)
     def valid(self) -> bool: return int(time.time()*1000) < self.expires_at
     def has(self, p: str) -> bool: return p in self.permissions
     def in_scope(self, r: str) -> bool:
