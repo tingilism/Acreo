@@ -446,6 +446,66 @@ class Identity:
             pair_id=pair_id,
             timestamp=now, nonce=nonce, challenge=ch, signature=sig)
 
+    def _x25519_keypair(self):
+        """Derive X25519 keypair from this identity's Ed25519 seed.
+
+        Lazy + cached. Uses the standard Ed25519→X25519 conversion that
+        libsodium implements as crypto_sign_ed25519_sk_to_curve25519.
+        Both keys live alongside each other; neither key compromises
+        the other within Curve25519's security model.
+        """
+        if self.kind not in ('user', 'agent'):
+            raise AcreoError("only user/agent identities have private keys")
+        if not hasattr(self, '_x25519_cache'):
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+            from cryptography.hazmat.primitives import serialization
+            import hashlib
+            # Take the Ed25519 32-byte seed, hash it with SHA-512, take the
+            # first 32 bytes, clamp to a valid X25519 scalar. Standard pattern.
+            seed = bytes.fromhex(self._priv.hex)
+            h = hashlib.sha512(seed).digest()
+            scalar = bytearray(h[:32])
+            scalar[0] &= 248
+            scalar[31] &= 127
+            scalar[31] |= 64
+            x_priv = X25519PrivateKey.from_private_bytes(bytes(scalar))
+            x_priv_hex = x_priv.private_bytes(
+                serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                serialization.NoEncryption()).hex()
+            x_pub_hex = x_priv.public_key().public_bytes(
+                serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
+            self._x25519_cache = (x_priv_hex, x_pub_hex)
+        return self._x25519_cache
+
+    @property
+    def peer_key(self) -> str:
+        """X25519 public key for sealed-message addressing (hex)."""
+        _, pub = self._x25519_keypair()
+        return pub
+
+    def send(self, peer_key_hex: str, payload: bytes) -> str:
+        """Encrypt payload to a peer's X25519 public key.
+
+        Returns a base64-encoded sealed blob. Only the holder of the matching
+        X25519 private key can decrypt. Sender is NOT authenticated by default
+        — sign the payload first if you need authenticated sealed messages.
+        """
+        if self.kind not in ('user', 'agent'):
+            raise AcreoError("only user/agent identities can send sealed messages")
+        from acreo_sealed import SealedMessage
+        if not isinstance(payload, (bytes, bytearray)):
+            raise TypeError(f"payload must be bytes, got {type(payload).__name__}")
+        return SealedMessage.seal(peer_key_hex, bytes(payload))
+
+    def receive(self, sealed_blob: str) -> bytes:
+        """Decrypt a sealed message addressed to this identity."""
+        if self.kind not in ('user', 'agent'):
+            raise AcreoError("only user/agent identities can receive sealed messages")
+        from acreo_sealed import SealedMessage
+        priv, _ = self._x25519_keypair()
+        return SealedMessage.unseal(priv, sealed_blob)
+
     def store(self, cred): self._creds[cred.credential_id]=cred
     def get_valid_credentials(self): return [c for c in self._creds.values() if c.valid()]
     def revoke(self, cid): self._revoked.add(cid)
