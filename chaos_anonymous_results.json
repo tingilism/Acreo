@@ -13,7 +13,7 @@
       "claim": "Bot generates anonymous proof, verifier accepts and identifies cred",
       "outcome": "PASS",
       "severity": "INFO",
-      "detail": "matched cred=b5af1d431321a6e0..."
+      "detail": "matched cred=2162983ec99eebe6..."
     },
     {
       "family": "anon",

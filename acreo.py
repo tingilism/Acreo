@@ -110,6 +110,23 @@ def _keypair() -> Tuple[str, str]:
                                 serialization.NoEncryption()).hex(),
             pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex())
 
+
+def _keypair_pq() -> Tuple[str, str]:
+    """Generate an ML-DSA-65 keypair, returned as hex-encoded strings.
+
+    Storing as hex keeps the Identity dataclass shape uniform — both
+    Ed25519 and PQ identities expose .public_key as hex string and
+    self._priv as ProtectedKey wrapping bytes.
+
+    ML-DSA-65 sizes: pk=1952B (3904 hex chars), sk=4032B (8064 hex chars),
+    sig=3309B (6618 hex chars). Roughly 60x the byte size of Ed25519.
+
+    Note: dilithium-py is an educational implementation, not constant-time.
+    See README for production-deployment caveats.
+    """
+    pk, sk = ML_DSA_65.keygen()
+    return (sk.hex(), pk.hex())
+
 # ─── Crypto suite identifiers (Stage D-1a) ──────────────────
 CRYPTO_SUITE_ED25519 = 'ed25519'
 CRYPTO_SUITE_ML_DSA_65 = 'ml-dsa-65'
@@ -407,9 +424,10 @@ class ConditionalProof:
 
 class Identity:
     """Cryptographic identity — user or AI agent."""
-    def __init__(self, priv, pub, kind='agent', label=''):
+    def __init__(self, priv, pub, kind='agent', label='', crypto_suite='ed25519'):
         self._priv = ProtectedKey(bytes.fromhex(priv) if isinstance(priv, str) else priv)
         self.public_key=pub; self.kind=kind; self.label=label
+        self.crypto_suite = crypto_suite
         self._log: List[Dict]=[]; self._creds: Dict[str,Credential]={}; self._revoked: set=set()
     def __del__(self):
         if hasattr(self, '_priv'): del self._priv
@@ -419,6 +437,14 @@ class Identity:
     @classmethod
     def create_agent(cls, label='agent') -> 'Identity':
         p,q=_keypair(); return cls(p,q,'agent',label)
+    @classmethod
+    def create_user_pq(cls, label='user') -> 'Identity':
+        """Create a user identity with ML-DSA-65 (post-quantum) signing."""
+        p,q=_keypair_pq(); return cls(p,q,'user',label,crypto_suite='ml-dsa-65')
+    @classmethod
+    def create_agent_pq(cls, label='agent') -> 'Identity':
+        """Create an agent identity with ML-DSA-65 (post-quantum) signing."""
+        p,q=_keypair_pq(); return cls(p,q,'agent',label,crypto_suite='ml-dsa-65')
     def delegate(self, agent_key: str, permissions: List[str],
                  scope=None, ttl_hours=24.0, max_uses=None,
                  spend_limit=None, metadata=None,
@@ -433,19 +459,32 @@ class Identity:
                    'issued_at':now,'expires_at':now+int(ttl_hours*3600000),
                    'max_uses':max_uses,'spend_limit':spend_limit,'protocol':PROTOCOL,
                    'heartbeat_interval_ms':heartbeat_interval_ms}
-        sig = _sign(self._priv.hex, bytes.fromhex(_challenge(payload)))
+        # Stage D-1b: suite-aware signing. Ed25519 path returns hex,
+        # ML-DSA-65 path returns bytes; we always hex-encode the result.
+        if self.crypto_suite == 'ed25519':
+            sig = _sign(self._priv.hex, bytes.fromhex(_challenge(payload)))
+        elif self.crypto_suite == 'ml-dsa-65':
+            sig_bytes = _sign_pq(self._priv.value, bytes.fromhex(_challenge(payload)))
+            sig = sig_bytes.hex()
+        else:
+            raise ValueError(f'unsupported crypto_suite: {self.crypto_suite}')
         meta = metadata or {}
         meta['issuer_pub'] = self.public_key
-        # Witness for anonymous proofs (Stage C-3)
-        from acreo_anon import generate_witness as _gen_witness
-        witness = _gen_witness(self._priv.hex, cid, agent_key,
-                                ','.join(sorted(permissions)))
+        # Witness for anonymous proofs (Stage C-3) — only for Ed25519 for now;
+        # PQ anonymous proofs are out of scope for D-1b
+        if self.crypto_suite == 'ed25519':
+            from acreo_anon import generate_witness as _gen_witness
+            witness = _gen_witness(self._priv.hex, cid, agent_key,
+                                    ','.join(sorted(permissions)))
+        else:
+            witness = None
         return Credential(credential_id=cid,agent_key=agent_key,user_commitment=commitment,
                           permissions=sorted(permissions),scope=sorted(scope or ['*']),
                           issued_at=now,expires_at=now+int(ttl_hours*3600000),
                           max_uses=max_uses,spend_limit=spend_limit,metadata=meta,signature=sig,
                           heartbeat_interval_ms=heartbeat_interval_ms,
-                          witness=witness)
+                          witness=witness,
+                          crypto_suite=self.crypto_suite)
     def prove_authorization(self, cred: Credential, action: str,
                              resource='*', context=None) -> ActionProof:
         if self.kind != 'agent': raise AcreoError("Only agents generate proofs")
@@ -968,7 +1007,17 @@ class Verifier:
                         'max_uses':c.max_uses,'spend_limit':c.spend_limit,'protocol':PROTOCOL,
                         'heartbeat_interval_ms':c.heartbeat_interval_ms}
         cred_challenge = _challenge(cred_payload)
-        if not _verify(issuer_pub, bytes.fromhex(cred_challenge), c.signature):
+        # Stage D-1b: suite-aware credential verification
+        cred_suite = getattr(c, 'crypto_suite', 'ed25519')
+        if cred_suite == 'ed25519':
+            sig_ok = _verify(issuer_pub, bytes.fromhex(cred_challenge), c.signature)
+        elif cred_suite == 'ml-dsa-65':
+            sig_ok = _verify_pq(bytes.fromhex(issuer_pub),
+                                 bytes.fromhex(cred_challenge),
+                                 bytes.fromhex(c.signature))
+        else:
+            sig_ok = False
+        if not sig_ok:
             return fail('credential_signature_invalid')
         if c.heartbeat_interval_ms is not None:
             last_hb = self._last_heartbeat.get(c.credential_id, c.issued_at)
