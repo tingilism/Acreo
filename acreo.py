@@ -360,6 +360,7 @@ class ActionProof:
     action: str; resource: str; challenge: str
     signature: str; timestamp: int; nonce: str
     context: Dict; protocol: str = PROTOCOL
+    crypto_suite: str = 'ed25519'  # Stage D-1c (ActionProof)
     def to_dict(self): return asdict(self)
     def to_json(self): return json.dumps(self.to_dict(), indent=2)
     @classmethod
@@ -370,6 +371,7 @@ class HeartbeatProof:
     proof_id: str; credential_id: str; agent_key: str
     timestamp: int; nonce: str; challenge: str; signature: str
     protocol: str = PROTOCOL
+    crypto_suite: str = 'ed25519'  # Stage D-1c (HeartbeatProof)
     def to_dict(self): return asdict(self)
     def to_json(self): return json.dumps(self.to_dict(), indent=2)
     @classmethod
@@ -416,6 +418,7 @@ class ConditionalProof:
     timestamp: int; nonce: str; challenge: str; signature: str
     protocol: str = PROTOCOL
     pair_id: Optional[str] = None  # shared session id agreed out-of-band
+    crypto_suite: str = 'ed25519'  # Stage D-1c (ConditionalProof)
     def to_dict(self): return asdict(self)
     def to_json(self): return json.dumps(self.to_dict(), indent=2)
     @classmethod
@@ -429,6 +432,31 @@ class Identity:
         self.public_key=pub; self.kind=kind; self.label=label
         self.crypto_suite = crypto_suite
         self._log: List[Dict]=[]; self._creds: Dict[str,Credential]={}; self._revoked: set=set()
+        # D-2 first half: explicit peer keypair at creation, no derivation.
+        # Ed25519 identities get a fresh X25519 keypair for sealed messaging.
+        # PQ identities get an ML-KEM-768 keypair (D-2 second half).
+        self._peer_priv = None
+        self.peer_key = None
+        if kind in ('user', 'agent'):
+            if crypto_suite == 'ed25519':
+                from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+                from cryptography.hazmat.primitives import serialization
+                _xp = X25519PrivateKey.generate()
+                _x_priv_hex = _xp.private_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PrivateFormat.Raw,
+                    serialization.NoEncryption()).hex()
+                _x_pub_hex = _xp.public_key().public_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw).hex()
+                self._peer_priv = ProtectedKey(bytes.fromhex(_x_priv_hex))
+                self.peer_key = _x_pub_hex
+            elif crypto_suite == 'ml-dsa-65':
+                # D-2 second half: ML-KEM-768 keypair for PQ sealed messaging
+                from acreo_sealed_pq import keygen as _kem_keygen
+                _km_priv_hex, _km_pub_hex = _kem_keygen()
+                self._peer_priv = ProtectedKey(bytes.fromhex(_km_priv_hex))
+                self.peer_key = _km_pub_hex
     def __del__(self):
         if hasattr(self, '_priv'): del self._priv
     @classmethod
@@ -496,11 +524,19 @@ class Identity:
         cd={'proof_id':pid,'credential_id':cred.credential_id,'agent_key':self.public_key,
             'action':action,'resource':resource,'timestamp':now,'nonce':nonce,'protocol':PROTOCOL}
         if context: cd['context_hash']=hashlib.sha3_256(json.dumps(context,sort_keys=True).encode()).hexdigest()
-        ch=_challenge(cd); sig=_sign(self._priv.hex,bytes.fromhex(ch))
+        ch=_challenge(cd)
+        # Stage D-1c: suite-aware action proof signing
+        if self.crypto_suite == 'ed25519':
+            sig=_sign(self._priv.hex,bytes.fromhex(ch))
+        elif self.crypto_suite == 'ml-dsa-65':
+            sig=_sign_pq(self._priv.value, bytes.fromhex(ch)).hex()
+        else:
+            raise ValueError(f'unsupported crypto_suite: {self.crypto_suite}')
         self._log.append({'action':action,'resource':resource,'proof_id':pid,'timestamp':now})
         return ActionProof(proof_id=pid,credential_id=cred.credential_id,agent_key=self.public_key,
                            action=action,resource=resource,challenge=ch,signature=sig,
-                           timestamp=now,nonce=nonce,context=context or {})
+                           timestamp=now,nonce=nonce,context=context or {},
+                           crypto_suite=self.crypto_suite)
     def prove_heartbeat(self, cred: Credential) -> HeartbeatProof:
         """Agent produces a signed heartbeat proving it's alive and uncompromised."""
         if self.kind != 'agent': raise AcreoError("Only agents produce heartbeats")
@@ -510,11 +546,19 @@ class Identity:
         now=int(time.time()*1000); nonce=Entropy.hex(16); pid=Entropy.hex(16)
         cd={'proof_id':pid,'credential_id':cred.credential_id,'agent_key':self.public_key,
             'timestamp':now,'nonce':nonce,'protocol':PROTOCOL,'kind':'heartbeat'}
-        ch=_challenge(cd); sig=_sign(self._priv.hex,bytes.fromhex(ch))
+        ch=_challenge(cd)
+        # Stage D-1c: suite-aware heartbeat signing
+        if self.crypto_suite == 'ed25519':
+            sig=_sign(self._priv.hex,bytes.fromhex(ch))
+        elif self.crypto_suite == 'ml-dsa-65':
+            sig=_sign_pq(self._priv.value, bytes.fromhex(ch)).hex()
+        else:
+            raise ValueError(f'unsupported crypto_suite: {self.crypto_suite}')
         self._log.append({'action':'heartbeat','proof_id':pid,'timestamp':now})
         return HeartbeatProof(proof_id=pid,credential_id=cred.credential_id,
                                agent_key=self.public_key,timestamp=now,nonce=nonce,
-                               challenge=ch,signature=sig)
+                               challenge=ch,signature=sig,
+                               crypto_suite=self.crypto_suite)
 
     def propose(self, cred: Credential, action: str, resource: str,
                 condition: Dict, valid_until_ms: int,
@@ -555,7 +599,14 @@ class Identity:
               'pair_id':pair_id,
               'timestamp':now,'nonce':nonce,'protocol':PROTOCOL,
               'kind':'conditional_proof'}
-        ch = _challenge(cd); sig = _sign(self._priv.hex, bytes.fromhex(ch))
+        ch = _challenge(cd)
+        # Stage D-1c: suite-aware proposal signing
+        if self.crypto_suite == 'ed25519':
+            sig = _sign(self._priv.hex, bytes.fromhex(ch))
+        elif self.crypto_suite == 'ml-dsa-65':
+            sig = _sign_pq(self._priv.value, bytes.fromhex(ch)).hex()
+        else:
+            raise ValueError(f'unsupported crypto_suite: {self.crypto_suite}')
         self._log.append({'kind':'propose','action':action,'resource':resource,
                            'proof_id':pid,'timestamp':now})
         return ConditionalProof(
@@ -564,67 +615,111 @@ class Identity:
             condition=condition, valid_after=valid_after,
             valid_until=valid_until_ms, paired_with=paired_with,
             pair_id=pair_id,
-            timestamp=now, nonce=nonce, challenge=ch, signature=sig)
+            timestamp=now, nonce=nonce, challenge=ch, signature=sig,
+            crypto_suite=self.crypto_suite)
 
     def _x25519_keypair(self):
-        """Derive X25519 keypair from this identity's Ed25519 seed.
+        """Return this identity's X25519 keypair (Ed25519 only).
 
-        Lazy + cached. Uses the standard Ed25519→X25519 conversion that
-        libsodium implements as crypto_sign_ed25519_sk_to_curve25519.
-        Both keys live alongside each other; neither key compromises
-        the other within Curve25519's security model.
+        D-2 first half: returns the explicitly-generated peer keypair
+        from __init__. No more lazy derivation. PQ identities raise
+        because they don't have an X25519 keypair (D-2 second half
+        adds ML-KEM as the parallel mechanism for them).
         """
         if self.kind not in ('user', 'agent'):
             raise AcreoError("only user/agent identities have private keys")
-        if not hasattr(self, '_x25519_cache'):
-            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-            from cryptography.hazmat.primitives import serialization
-            import hashlib
-            # Take the Ed25519 32-byte seed, hash it with SHA-512, take the
-            # first 32 bytes, clamp to a valid X25519 scalar. Standard pattern.
-            seed = bytes.fromhex(self._priv.hex)
-            h = hashlib.sha512(seed).digest()
-            scalar = bytearray(h[:32])
-            scalar[0] &= 248
-            scalar[31] &= 127
-            scalar[31] |= 64
-            x_priv = X25519PrivateKey.from_private_bytes(bytes(scalar))
-            x_priv_hex = x_priv.private_bytes(
-                serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
-                serialization.NoEncryption()).hex()
-            x_pub_hex = x_priv.public_key().public_bytes(
-                serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
-            self._x25519_cache = (x_priv_hex, x_pub_hex)
-        return self._x25519_cache
+        if getattr(self, 'crypto_suite', 'ed25519') != 'ed25519':
+            raise AcreoError(
+                f'X25519 keypair not available for crypto_suite='
+                f'{self.crypto_suite!r} (D-2 will add ML-KEM)')
+        if self._peer_priv is None or self.peer_key is None:
+            raise AcreoError('peer keypair not initialized')
+        return (self._peer_priv.hex, self.peer_key)
 
-    @property
-    def peer_key(self) -> str:
-        """X25519 public key for sealed-message addressing (hex)."""
-        _, pub = self._x25519_keypair()
-        return pub
+    # peer_key is now a regular instance attribute set in __init__ (D-2 first half).
+    # No longer a @property — explicit storage at creation time.
 
     def send(self, peer_key_hex: str, payload: bytes) -> str:
-        """Encrypt payload to a peer's X25519 public key.
+        """Encrypt payload to a peer's public key.
 
         Returns a base64-encoded sealed blob. Only the holder of the matching
-        X25519 private key can decrypt. Sender is NOT authenticated by default
+        private key can decrypt. Sender is NOT authenticated by default
         — sign the payload first if you need authenticated sealed messages.
+
+        Stage D-2: dispatches by recipient's peer_key size:
+          - 64 hex chars   = X25519 (SealedMessage)
+          - 2368 hex chars = ML-KEM-768 (SealedMessagePQ)
+        Sender's own crypto_suite doesn't matter — sealed messaging is
+        asymmetric. Sender just needs the recipient's public key.
         """
+        # D2_SEND_DISPATCH_MARKER
         if self.kind not in ('user', 'agent'):
             raise AcreoError("only user/agent identities can send sealed messages")
-        from acreo_sealed import SealedMessage
         if not isinstance(payload, (bytes, bytearray)):
             raise TypeError(f"payload must be bytes, got {type(payload).__name__}")
-        return SealedMessage.seal(peer_key_hex, bytes(payload))
+        if len(peer_key_hex) == 64:
+            from acreo_sealed import SealedMessage
+            return SealedMessage.seal(peer_key_hex, bytes(payload))
+        elif len(peer_key_hex) == 2368:
+            from acreo_sealed_pq import SealedMessagePQ
+            return SealedMessagePQ.seal(peer_key_hex, bytes(payload))
+        else:
+            raise ValueError(
+                f"unrecognized peer_key length {len(peer_key_hex)} hex chars "
+                f"(expected 64 for X25519 or 2368 for ML-KEM-768)")
 
     def receive(self, sealed_blob: str) -> bytes:
-        """Decrypt a sealed message addressed to this identity."""
+        """Decrypt a sealed message addressed to this identity.
+
+        Stage D-2: dispatches by self.crypto_suite. Ed25519 identities use
+        X25519 + SealedMessage; PQ identities use ML-KEM-768 + SealedMessagePQ.
+        """
+        # D2_RECEIVE_DISPATCH_MARKER
         if self.kind not in ('user', 'agent'):
             raise AcreoError("only user/agent identities can receive sealed messages")
-        from acreo_sealed import SealedMessage
-        priv, _ = self._x25519_keypair()
-        return SealedMessage.unseal(priv, sealed_blob)
+        if self._peer_priv is None or self.peer_key is None:
+            raise AcreoError("peer keypair not initialized")
+        if self.crypto_suite == 'ed25519':
+            from acreo_sealed import SealedMessage
+            return SealedMessage.unseal(self._peer_priv.hex, sealed_blob)
+        elif self.crypto_suite == 'ml-dsa-65':
+            from acreo_sealed_pq import SealedMessagePQ
+            return SealedMessagePQ.unseal(self._peer_priv.hex, sealed_blob)
+        else:
+            raise ValueError(f"unknown crypto_suite: {self.crypto_suite}")
+
+    # ─── Stage E: Activity Stream ──────────────────────────────────
+    # Verifiable hash-chained record of agent observations, reasoning,
+    # actions, and state snapshots. Suite-aware (Ed25519 + PQ).
+    @property
+    def activity_stream(self):
+        """Lazy-cached ActivityStream for this identity.
+
+        Stage E: returns the same stream instance across calls so the
+        hash chain advances correctly. Creating a fresh stream per
+        access would reset the chain and make it useless.
+        """
+        # E_ACTIVITY_STREAM_PROPERTY_MARKER
+        if not hasattr(self, '_activity_stream_cache'):
+            from acreo_activity_stream import ActivityStream
+            self._activity_stream_cache = ActivityStream(self)
+        return self._activity_stream_cache
+
+    def record_observation(self, payload):
+        """Record something the agent perceived as a signed activity frame."""
+        return self.activity_stream.record_observation(payload)
+
+    def record_reasoning(self, payload):
+        """Record an internal reasoning step as a signed activity frame."""
+        return self.activity_stream.record_reasoning(payload)
+
+    def record_action(self, payload):
+        """Record an external action as a signed activity frame."""
+        return self.activity_stream.record_action(payload)
+
+    def record_state(self, payload):
+        """Record an internal state snapshot as a signed activity frame."""
+        return self.activity_stream.record_state(payload)
 
     def report(self, operator_peer_key: str, cred: 'Credential',
                event_type: str, payload: Dict) -> str:
@@ -734,7 +829,17 @@ class Verifier:
             'protocol':proof.protocol,'kind':'heartbeat'}
         if not _seq(_challenge(cd),proof.challenge):
             return {'valid':False,'reason':'heartbeat_challenge_mismatch'}
-        if not _verify(proof.agent_key,bytes.fromhex(proof.challenge),proof.signature):
+        # Stage D-1c: suite-aware heartbeat signature check
+        hb_suite = getattr(proof, 'crypto_suite', 'ed25519')
+        if hb_suite == 'ed25519':
+            hb_sig_ok = _verify(proof.agent_key, bytes.fromhex(proof.challenge), proof.signature)
+        elif hb_suite == 'ml-dsa-65':
+            hb_sig_ok = _verify_pq(bytes.fromhex(proof.agent_key),
+                                    bytes.fromhex(proof.challenge),
+                                    bytes.fromhex(proof.signature))
+        else:
+            hb_sig_ok = False
+        if not hb_sig_ok:
             return {'valid':False,'reason':'heartbeat_signature_invalid'}
         self._nonces[nk]=now
         self._last_heartbeat[proof.credential_id]=now
@@ -943,7 +1048,21 @@ class Verifier:
                         'max_uses':c.max_uses,'spend_limit':c.spend_limit,
                         'protocol':PROTOCOL,
                         'heartbeat_interval_ms':c.heartbeat_interval_ms}
-        if not _verify(issuer_pub, bytes.fromhex(_challenge(cred_payload)), c.signature):
+        # Stage D-1c follow-up: suite-aware credential signature check
+        # in verify_proposal (was bare _verify, now dispatches by cred.crypto_suite)
+        prop_cred_suite = getattr(c, 'crypto_suite', 'ed25519')
+        prop_cred_challenge = _challenge(cred_payload)
+        if prop_cred_suite == 'ed25519':
+            prop_cred_sig_ok = _verify(issuer_pub,
+                                        bytes.fromhex(prop_cred_challenge),
+                                        c.signature)
+        elif prop_cred_suite == 'ml-dsa-65':
+            prop_cred_sig_ok = _verify_pq(bytes.fromhex(issuer_pub),
+                                           bytes.fromhex(prop_cred_challenge),
+                                           bytes.fromhex(c.signature))
+        else:
+            prop_cred_sig_ok = False
+        if not prop_cred_sig_ok:
             return fail('proposal_credential_signature_invalid')
         # Permission and scope checks
         if not c.has(proof.action):
@@ -967,7 +1086,17 @@ class Verifier:
               'kind':'conditional_proof'}
         if not _seq(_challenge(cd), proof.challenge):
             return fail('proposal_challenge_mismatch')
-        if not _verify(proof.agent_key, bytes.fromhex(proof.challenge), proof.signature):
+        # Stage D-1c: suite-aware proposal signature check
+        prop_suite = getattr(proof, 'crypto_suite', 'ed25519')
+        if prop_suite == 'ed25519':
+            prop_sig_ok = _verify(proof.agent_key, bytes.fromhex(proof.challenge), proof.signature)
+        elif prop_suite == 'ml-dsa-65':
+            prop_sig_ok = _verify_pq(bytes.fromhex(proof.agent_key),
+                                      bytes.fromhex(proof.challenge),
+                                      bytes.fromhex(proof.signature))
+        else:
+            prop_sig_ok = False
+        if not prop_sig_ok:
             return fail('proposal_signature_invalid')
         result = {'valid':True,'kind':'proposal','proof_id':proof.proof_id,
                   'credential_id':proof.credential_id,'agent_key':proof.agent_key,
@@ -1030,7 +1159,17 @@ class Verifier:
             'nonce':proof.nonce,'protocol':proof.protocol}
         if proof.context: cd['context_hash']=hashlib.sha3_256(json.dumps(proof.context,sort_keys=True).encode()).hexdigest()
         if not _seq(_challenge(cd),proof.challenge): return fail('challenge_mismatch')
-        if not _verify(proof.agent_key,bytes.fromhex(proof.challenge),proof.signature):
+        # Stage D-1c: suite-aware action signature check
+        ap_suite = getattr(proof, 'crypto_suite', 'ed25519')
+        if ap_suite == 'ed25519':
+            ap_sig_ok = _verify(proof.agent_key, bytes.fromhex(proof.challenge), proof.signature)
+        elif ap_suite == 'ml-dsa-65':
+            ap_sig_ok = _verify_pq(bytes.fromhex(proof.agent_key),
+                                    bytes.fromhex(proof.challenge),
+                                    bytes.fromhex(proof.signature))
+        else:
+            ap_sig_ok = False
+        if not ap_sig_ok:
             return fail('signature_invalid')
         self._nonces[nk]=now
         result={'valid':True,'action':proof.action,'resource':proof.resource,

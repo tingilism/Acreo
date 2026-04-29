@@ -1,0 +1,107 @@
+{
+  "total": 12,
+  "summary": {
+    "PASS": 12,
+    "FAIL": 0,
+    "SKIP": 0,
+    "ERROR": 0
+  },
+  "results": [
+    {
+      "family": "activity",
+      "name": "forged_genesis_frame",
+      "claim": "Attacker constructs a genesis frame with their key claiming target's identity",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: signature_invalid"
+    },
+    {
+      "family": "activity",
+      "name": "fork_attempt",
+      "claim": "Two divergent streams from same prefix \u2014 both verify, but verifier sees they fork",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "fork is detectable by external observer"
+    },
+    {
+      "family": "activity",
+      "name": "wrong_suite_in_stream",
+      "claim": "Frame with wrong crypto_suite tag in PQ stream rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: signature_invalid"
+    },
+    {
+      "family": "activity",
+      "name": "key_substitution",
+      "claim": "Frame's agent_key swapped to attacker's key while keeping target's signature",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: signature_invalid"
+    },
+    {
+      "family": "activity",
+      "name": "partial_segment_no_starting_hash",
+      "claim": "Partial segment verification without starting_chain_hash defaults to genesis (correctly fails)",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: chain_break"
+    },
+    {
+      "family": "activity",
+      "name": "partial_segment_with_starting_hash",
+      "claim": "Partial segment verification works correctly with explicit starting_chain_hash",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "verified 2 frames"
+    },
+    {
+      "family": "activity",
+      "name": "large_stream_50_frames",
+      "claim": "Stream of 50 frames verifies in single segment without errors",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "verified 50 frames"
+    },
+    {
+      "family": "activity",
+      "name": "duplicate_frame_id_within_segment",
+      "claim": "Two frames with same frame_id (one duplicated) blocked by verifier replay tracking",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: replay_detected"
+    },
+    {
+      "family": "activity",
+      "name": "wrong_protocol_string",
+      "claim": "Frame with bogus protocol string rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: unknown_protocol:bogus-protocol-v99"
+    },
+    {
+      "family": "activity",
+      "name": "empty_segment_rejected",
+      "claim": "Empty list of frames cleanly rejected",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: empty_segment"
+    },
+    {
+      "family": "activity",
+      "name": "user_identity_cannot_stream",
+      "claim": "User identity (kind='user') cannot create activity stream",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "raised AcreoError: only agent identities can produce activity streams (got kind='user')"
+    },
+    {
+      "family": "activity",
+      "name": "convenience_methods_advance_chain",
+      "claim": "Identity.record_* methods advance the chain across multiple calls",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "3 frames, chain advances correctly, all verify"
+    }
+  ]
+}

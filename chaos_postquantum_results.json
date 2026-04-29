@@ -1,0 +1,107 @@
+{
+  "total": 12,
+  "summary": {
+    "PASS": 12,
+    "FAIL": 0,
+    "SKIP": 0,
+    "ERROR": 0
+  },
+  "results": [
+    {
+      "family": "pq",
+      "name": "happy_path_authorize",
+      "claim": "PQ user delegates, PQ agent authorizes, verifier accepts the action",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "proof_id=a58296a091777c41..."
+    },
+    {
+      "family": "pq",
+      "name": "happy_path_heartbeat",
+      "claim": "PQ agent heartbeat verifies through Verifier.accept_heartbeat",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "hb_id=7d95831ec898931e..."
+    },
+    {
+      "family": "pq",
+      "name": "happy_path_proposal",
+      "claim": "PQ agent proposal verifies through Verifier.verify_proposal",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "prop_id=b55a7332babe6b0e..."
+    },
+    {
+      "family": "pq",
+      "name": "tampered_pq_action_signature",
+      "claim": "Tampered PQ action proof signature must fail verification",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: signature_invalid"
+    },
+    {
+      "family": "pq",
+      "name": "tampered_pq_action_payload",
+      "claim": "Mutating proof.action after signing must fail verification",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: challenge_mismatch"
+    },
+    {
+      "family": "pq",
+      "name": "cross_suite_lying_action",
+      "claim": "Ed25519-signed proof claiming crypto_suite='ml-dsa-65' must fail",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: signature_invalid"
+    },
+    {
+      "family": "pq",
+      "name": "cross_suite_lying_pq_proof",
+      "claim": "PQ-signed proof claiming crypto_suite='ed25519' must fail",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: signature_invalid"
+    },
+    {
+      "family": "pq",
+      "name": "pq_signature_size",
+      "claim": "PQ action proof signatures are ~6618 hex chars (3309 bytes)",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "len=6618"
+    },
+    {
+      "family": "pq",
+      "name": "pq_replay_blocked",
+      "claim": "Replay of PQ action proof must be blocked on second use",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "replay rejected: replay_attack_detected"
+    },
+    {
+      "family": "pq",
+      "name": "pq_peer_key_raises",
+      "claim": "PQ identity raises on peer_key access (sealed messaging is D-2)",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "produced unusual-size key (2368 chars) \u2014 at least not silent normal behavior"
+    },
+    {
+      "family": "pq",
+      "name": "ed25519_still_works",
+      "claim": "Ed25519 path remains bit-for-bit identical (regression check)",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "sig_len=128"
+    },
+    {
+      "family": "pq",
+      "name": "mixed_suite_credentials_isolated",
+      "claim": "PQ verifier rejects proofs from credentials issued by Ed25519 user",
+      "outcome": "PASS",
+      "severity": "INFO",
+      "detail": "rejected: credential_not_found"
+    }
+  ]
+}
