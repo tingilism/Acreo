@@ -13,7 +13,7 @@
       "claim": "A well-formed matched pair settles successfully",
       "outcome": "PASS",
       "severity": "INFO",
-      "detail": "settled, pair_key=5404c46af0897f6a69a5a922..."
+      "detail": "settled, pair_key=86e0ee675d63d1a95273864c..."
     },
     {
       "family": "settle",
@@ -61,7 +61,7 @@
       "claim": "A pair whose window ended before settlement must be rejected",
       "outcome": "PASS",
       "severity": "INFO",
-      "detail": "rejected: proof_a_invalid:proposal_expired:1777421403080>=1777421402579"
+      "detail": "rejected: proof_a_invalid:proposal_expired:1777513521295>=1777513520795"
     },
     {
       "family": "settle",
@@ -85,7 +85,7 @@
       "claim": "Extending valid_until past the signed value must be rejected",
       "outcome": "PASS",
       "severity": "INFO",
-      "detail": "rejected: proof_a_invalid:proposal_expired:1777421404113>=1777421403612"
+      "detail": "rejected: proof_a_invalid:proposal_expired:1777513522332>=1777513521832"
     }
   ]
 }

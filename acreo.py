@@ -585,7 +585,8 @@ class Identity:
             raise CredentialError(f"Resource out of scope: {resource}")
         if not isinstance(condition, dict) or 'type' not in condition:
             raise ValueError("condition must be a dict with a 'type' field")
-        if condition['type'] not in ('always', 'counterparty_proof'):
+        # Stage F: 'compliance_flag' added for compliance operation
+        if condition['type'] not in ('always', 'counterparty_proof', 'compliance_flag'):
             raise ValueError(f"Unknown condition type: {condition['type']}")
         now = int(time.time() * 1000)
         if valid_until_ms <= now:
@@ -1072,7 +1073,8 @@ class Verifier:
         # Condition shape
         if not isinstance(proof.condition, dict) or 'type' not in proof.condition:
             return fail('proposal_malformed_condition')
-        if proof.condition['type'] not in ('always', 'counterparty_proof'):
+        # Stage F: 'compliance_flag' added for compliance operation
+        if proof.condition['type'] not in ('always', 'counterparty_proof', 'compliance_flag'):
             return fail(f'proposal_unknown_condition_type:{proof.condition["type"]}')
         # Re-derive challenge and verify signature on the proposal itself
         cd = {'proof_id':proof.proof_id,'credential_id':proof.credential_id,
