@@ -5,3 +5,5 @@ chaos_results.json
 chaos_heartbeat_results.json
 chaos_mcp_results.json
 __pycache__/
+
+chaos_*_results.json
