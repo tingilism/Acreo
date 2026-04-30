@@ -104,6 +104,7 @@ def setup_fa(filings_dir: str):
         operator=operator,
         verifier=acreo._verifier,
         filings_dir=filings_dir,
+        trusted_ma_keys={ma_identity.public_key},
     )
 
     return acreo, operator, ma_identity, ma_credential, fa

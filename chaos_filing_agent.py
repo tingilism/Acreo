@@ -145,6 +145,7 @@ def setup_fa(filings_dir: str, fa_perms=('write', 'communicate'),
     fa = FilingAgent(
         identity=fa_id, credential=fa_cred, operator=op,
         verifier=acreo._verifier, filings_dir=filings_dir,
+        trusted_ma_keys={ma_id.public_key},
     )
     return acreo, op, ma_id, ma_cred, fa
 
@@ -167,13 +168,16 @@ def ma_proof(ma_id, ma_cred, flag, valid_until_ms=None,
 # ═══════════════════════════════════════════════════════════════════════
 
 @attack("filing", "forged_ma_identity",
-        "Attacker signs flag with own key, claims to be MA — FA rejects on sig")
+        "Attacker with valid Acreo credential but unregistered with FA — rejected")
 def forged_ma_identity():
+    """Phase 1.5: FA holds a registry of trusted MA pubkeys. Attacker has a
+    valid op-issued credential but isn't in FA's registry. FA rejects."""
     d = tempfile.mkdtemp(prefix='chaos_fa_forge_ma_')
     try:
         acreo, op, ma_id, ma_cred, fa = setup_fa(d)
+        # FA already has ma_id.public_key registered (via setup_fa).
+        # Attacker gets their own credential but isn't in FA's registry.
         attacker = acreo.create_agent('attacker')
-        # Attacker has no credential issued by op for compliance work
         try:
             attacker_cred = acreo.delegate(
                 op, attacker, permissions=['communicate'],
@@ -181,33 +185,24 @@ def forged_ma_identity():
                 heartbeat_interval_ms=300000,
             )
             flag = make_flag()
-            # Attacker's proof signed with attacker's own key
             proof = ma_proof(attacker, attacker_cred, flag)
-            # FA receives this — it's a valid Acreo proof from a different agent.
-            # Question is whether FA does any agent-key matching against MA.
-            # Phase 1 doesn't bind FA to a specific MA (multi-MA in Phase 2).
-            # The verifier validates the proof; FA accepts.
             result = fa.receive_flag(proof)
-            # In Phase 1 architecture, an attacker with valid op-issued
-            # credential CAN file flags. This is a known trust boundary.
-            # The mitigation comes in Phase 2 where FA only accepts flags
-            # from registered MA identities. For Phase 1 we record this
-            # as a known limitation.
-            if result.accepted and result.filing_id:
-                record_fail("filing", "forged_ma_identity",
-                            "Attacker signs flag with own key, claims to be MA — FA rejects on sig",
-                            SEVERITY_HIGH_RANK,
-                            "Phase 1 architecture trusts any op-credentialed agent; "
-                            "needs MA-binding in Phase 2")
-            else:
+            if not result.accepted and result.rejection_reason == 'unregistered_ma':
                 record_pass("filing", "forged_ma_identity",
-                            "Attacker signs flag with own key, claims to be MA — FA rejects on sig",
+                            "Attacker with valid Acreo credential but unregistered with FA — rejected",
                             f"rejected: {result.rejection_reason}")
+            elif not result.accepted:
+                record_pass("filing", "forged_ma_identity",
+                            "Attacker with valid Acreo credential but unregistered with FA — rejected",
+                            f"rejected: {result.rejection_reason} (different reason than expected)")
+            else:
+                record_fail("filing", "forged_ma_identity",
+                            "Attacker with valid Acreo credential but unregistered with FA — rejected",
+                            SEVERITY_HIGH_RANK,
+                            "unregistered MA's flag accepted — MA-binding broken")
         except Exception as e:
-            # If the credential delegation itself failed for some reason,
-            # the attack didn't actually run
             record_fail("filing", "forged_ma_identity",
-                        "Attacker signs flag with own key, claims to be MA — FA rejects on sig",
+                        "Attacker with valid Acreo credential but unregistered with FA — rejected",
                         SEVERITY_LOW_RANK,
                         f"setup error: {type(e).__name__}: {e}")
     finally:
@@ -451,8 +446,11 @@ def reused_proof_different_flag():
 
 
 @attack("filing", "fa_credential_revoked",
-        "FA's own credential expired — its filings still record but trust fails")
+        "FA's own credential expired — Phase 1.7 self-validation rejects flag")
 def fa_credential_revoked():
+    """Phase 1.7: FA self-validates its own credential at the top of
+    each receive_flag call. Expired credential → rejection with reason
+    'fa_credential_expired'."""
     d = tempfile.mkdtemp(prefix='chaos_fa_revoked_')
     try:
         acreo, op, ma_id, ma_cred, fa = setup_fa(d)
@@ -460,17 +458,20 @@ def fa_credential_revoked():
         fa.credential.expires_at = int(time.time() * 1000) - 1000
         flag = make_flag()
         proof = ma_proof(ma_id, ma_cred, flag)
-        # FA can still process internally (it doesn't re-check own cred per
-        # call in Phase 1) but downstream verifiers would reject FA's
-        # ActionProofs. Note this as a Phase 1.5 hardening item.
         result = fa.receive_flag(proof)
-        # Either outcome is informational — Phase 1's contract is unclear
-        # on whether FA self-validates its own credential. Document.
-        record_pass("filing", "fa_credential_revoked",
-                    "FA's own credential expired — its filings still record but trust fails",
-                    f"FA processed (Phase 1 doesn't self-validate); "
-                    f"result: accepted={result.accepted}, "
-                    f"filing_id={'set' if result.filing_id else 'none'}")
+        if not result.accepted and result.rejection_reason == 'fa_credential_expired':
+            record_pass("filing", "fa_credential_revoked",
+                        "FA's own credential expired — Phase 1.7 self-validation rejects flag",
+                        f"rejected: {result.rejection_reason}")
+        elif not result.accepted:
+            record_pass("filing", "fa_credential_revoked",
+                        "FA's own credential expired — Phase 1.7 self-validation rejects flag",
+                        f"rejected: {result.rejection_reason} (different reason)")
+        else:
+            record_fail("filing", "fa_credential_revoked",
+                        "FA's own credential expired — Phase 1.7 self-validation rejects flag",
+                        SEVERITY_HIGH_RANK,
+                        "FA processed flag with expired own credential")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -517,15 +518,12 @@ def activity_stream_tamper():
 
 
 @attack("filing", "severity_inflation_caught",
-        "Inflated severity in flag content is caught only by FA policy, not crypto")
+        "Inflated severity caught by Phase 1.7 risk-score cross-check")
 def severity_inflation():
-    """Honest informational test: a malicious MA can claim
-    severity=CRITICAL when underlying data is benign. Acreo's crypto
-    doesn't catch this — only domain logic (cross-checking against
-    on-chain data, sanctions list, etc.) catches inflation. Phase 1 FA
-    files based on declared severity and trusts MA. Document as known
-    limitation; Phase 2's MA verification chain (FA independently
-    verifies on-chain evidence) closes this gap."""
+    """Phase 1.7: FA cross-checks declared severity against risk_score.
+    A flag claiming severity=CRITICAL with risk_score=0.1 is rejected
+    because CRITICAL is more than one tier above what risk_score 0.1
+    warrants (which is LOW)."""
     d = tempfile.mkdtemp(prefix='chaos_fa_inflate_')
     try:
         acreo, op, ma_id, ma_cred, fa = setup_fa(d)
@@ -533,17 +531,19 @@ def severity_inflation():
         flag = make_flag(severity=SEVERITY_CRITICAL, risk_score=0.1)
         proof = ma_proof(ma_id, ma_cred, flag)
         result = fa.receive_flag(proof)
-        # Phase 1 trusts severity — will file. This is documented as the
-        # gap that Phase 2's independent verification closes.
-        if result.accepted and result.filing_id:
+        if not result.accepted and result.rejection_reason == 'severity_exceeds_risk_score':
             record_pass("filing", "severity_inflation_caught",
-                        "Inflated severity in flag content is caught only by FA policy, not crypto",
-                        "Phase 1 trusts MA's declared severity; "
-                        "Phase 2 closes this with independent on-chain verification")
+                        "Inflated severity caught by Phase 1.7 risk-score cross-check",
+                        f"rejected: {result.rejection_reason}")
+        elif not result.accepted:
+            record_pass("filing", "severity_inflation_caught",
+                        "Inflated severity caught by Phase 1.7 risk-score cross-check",
+                        f"rejected: {result.rejection_reason} (different reason)")
         else:
-            record_pass("filing", "severity_inflation_caught",
-                        "Inflated severity in flag content is caught only by FA policy, not crypto",
-                        f"unexpected rejection: {result.rejection_reason}")
+            record_fail("filing", "severity_inflation_caught",
+                        "Inflated severity caught by Phase 1.7 risk-score cross-check",
+                        SEVERITY_HIGH_RANK,
+                        "severity inflation accepted — Phase 1.7 cross-check broken")
     finally:
         shutil.rmtree(d, ignore_errors=True)
 

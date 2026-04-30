@@ -45,6 +45,7 @@ OUT OF SCOPE FOR PHASE 1:
 from __future__ import annotations
 import os
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -68,6 +69,33 @@ from agents.compliance_schemas import (
 # Filing decision thresholds — tunable per deployment
 DEFAULT_AUTO_FILE_SEVERITIES = (SEVERITY_HIGH, SEVERITY_CRITICAL)
 DEFAULT_FRESHNESS_WINDOW_MS = 24 * 60 * 60 * 1000  # 24 hours
+
+# Phase 1.7: severity-vs-risk-score cross-check.
+# Maps risk_score thresholds to maximum allowable severity tier.
+# A flag with risk_score in [low_bound, high_bound) cannot legitimately
+# claim a severity higher than max_severity. One-tier tolerance is allowed
+# (e.g. risk_score=0.1 may declare LOW or MEDIUM but not HIGH or CRITICAL).
+SEVERITY_TIER_ORDER = (SEVERITY_LOW, SEVERITY_MEDIUM, SEVERITY_HIGH, SEVERITY_CRITICAL)
+
+
+def max_severity_for_risk(risk_score: float) -> str:
+    """Return the maximum severity tier warranted by a given risk_score."""
+    if risk_score < 0.30:
+        return SEVERITY_LOW
+    elif risk_score < 0.60:
+        return SEVERITY_MEDIUM
+    elif risk_score < 0.85:
+        return SEVERITY_HIGH
+    else:
+        return SEVERITY_CRITICAL
+
+
+def severity_within_tolerance(declared: str, risk_score: float) -> bool:
+    """True if declared severity is within one tier of what risk_score warrants."""
+    max_warranted = max_severity_for_risk(risk_score)
+    declared_idx = SEVERITY_TIER_ORDER.index(declared)
+    warranted_idx = SEVERITY_TIER_ORDER.index(max_warranted)
+    return declared_idx <= warranted_idx + 1
 
 # Reasons for skipping a filing — for audit trail clarity
 SKIP_LOW_SEVERITY = "low_severity_below_threshold"
@@ -116,7 +144,8 @@ class FilingAgent:
                  verifier,
                  filings_dir: str = './mock_filings',
                  auto_file_severities: tuple = DEFAULT_AUTO_FILE_SEVERITIES,
-                 freshness_window_ms: int = DEFAULT_FRESHNESS_WINDOW_MS):
+                 freshness_window_ms: int = DEFAULT_FRESHNESS_WINDOW_MS,
+                 trusted_ma_keys: Optional[set] = None):
         if identity.kind != 'agent':
             raise AcreoError(
                 f"FilingAgent requires agent identity, got kind={identity.kind!r}")
@@ -138,6 +167,14 @@ class FilingAgent:
         self.filings_dir.mkdir(parents=True, exist_ok=True)
         self.auto_file_severities = set(auto_file_severities)
         self.freshness_window_ms = freshness_window_ms
+        # Phase 1.5: explicit MA-binding. If non-empty, only flags from
+        # listed pubkeys are accepted. If None/empty, Phase 1 permissive
+        # behavior (any operator-credentialed agent can flag).
+        self.trusted_ma_keys = set(trusted_ma_keys) if trusted_ma_keys else set()
+        # Phase 1.6: coarse lock to serialize flag processing per FA instance.
+        # Protects dedup set, filings list, and activity stream chain from
+        # concurrent mutation. See chaos_filing_agent::parallel_filing_race.
+        self._lock = threading.Lock()
 
         # Operational state
         self._seen_flag_hashes: set = set()
@@ -159,7 +196,39 @@ class FilingAgent:
         Stage F architecture: the ComplianceFlag is the condition. The
         cryptographic primitive (ConditionalProof) commits the sender to
         the flag; the flag fields are extracted from proof.condition.
+
+        Phase 1.6: serialized via self._lock. Flag processing per FA
+        instance is single-threaded; concurrent callers wait for the lock.
         """
+        with self._lock:
+            return self._receive_flag_locked(proof)
+
+    def _receive_flag_locked(self, proof: ConditionalProof) -> FilingResult:
+        """Inner implementation of receive_flag, called under self._lock.
+
+        Split out so the locking is unambiguous: caller acquires lock,
+        this method does the work, caller releases on return.
+        """
+        # Phase 1.7: FA self-validation. Check own credential before
+        # processing anything. If FA's credential has expired or been
+        # revoked, FA must not produce filings — its ActionProofs would
+        # be rejected by downstream verifiers anyway.
+        now_ms = int(time.time() * 1000)
+        if self.credential.expires_at <= now_ms:
+            return FilingResult(
+                accepted=False,
+                rejection_reason='fa_credential_expired',
+            )
+
+        # Phase 1.5: MA-binding check. If trusted_ma_keys is non-empty,
+        # only registered MA pubkeys can produce flags. Empty set means
+        # Phase 1 permissive behavior (backward compatible).
+        if self.trusted_ma_keys and proof.agent_key not in self.trusted_ma_keys:
+            return FilingResult(
+                accepted=False,
+                rejection_reason='unregistered_ma',
+            )
+
         # Extract the flag from the proof's condition field
         if not isinstance(proof.condition, dict):
             return FilingResult(
@@ -178,6 +247,16 @@ class FilingAgent:
             return FilingResult(
                 accepted=False,
                 rejection_reason=f'flag_extraction_failed:{type(e).__name__}',
+            )
+
+        # Phase 1.7: severity-vs-risk-score cross-check. Reject flags whose
+        # declared severity is more than one tier above what risk_score
+        # warrants. This catches malicious or buggy MAs claiming high
+        # severity for benign events.
+        if not severity_within_tolerance(flag.severity, flag.risk_score):
+            return FilingResult(
+                accepted=False,
+                rejection_reason='severity_exceeds_risk_score',
             )
 
         # Record the observation: we received a flag
