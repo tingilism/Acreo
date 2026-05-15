@@ -61,7 +61,9 @@ contract OracleConfirmedPolicy {
         InvalidSignature,         // signature didn't recover to declared oracle
         DuplicateOracle,          // same oracle signed twice
         UnknownOracle,            // signer not in declared oracle set
-        Replay                    // action nonce already consumed
+        Replay,                   // action nonce already consumed
+        FeedMismatch,             // FIX J: attestation feed != policy feed
+        ZeroPrice                 // FIX K: oracle submitted price 0
     }
 
     struct OracleSet {
@@ -69,6 +71,7 @@ contract OracleConfirmedPolicy {
         uint8 threshold;          // n in "n-of-m"
         uint256 toleranceBps;     // max spread between min and max, in basis points
         uint256 maxAgeSeconds;    // reject prices older than this
+        bytes32 expectedFeedId;   // FIX J: the feed this policy is pinned to
         bool exists;
     }
 
@@ -115,8 +118,10 @@ contract OracleConfirmedPolicy {
         address[] calldata oracles,
         uint8 threshold,
         uint256 toleranceBps,
-        uint256 maxAgeSeconds
+        uint256 maxAgeSeconds,
+        bytes32 expectedFeedId
     ) external onlyOwner {
+        require(expectedFeedId != bytes32(0), "OCP: zero feed id");
         require(oracles.length > 0, "OCP: no oracles");
         require(threshold > 0 && threshold <= oracles.length, "OCP: bad threshold");
         require(toleranceBps <= 10000, "OCP: tolerance > 100%");
@@ -136,6 +141,7 @@ contract OracleConfirmedPolicy {
             threshold: threshold,
             toleranceBps: toleranceBps,
             maxAgeSeconds: maxAgeSeconds,
+            expectedFeedId: expectedFeedId,
             exists: true
         });
 
@@ -190,6 +196,12 @@ contract OracleConfirmedPolicy {
                 revert("OCP: future");
             }
 
+            // FIX J: every attestation must be for the policy's pinned feed
+            if (att.dataFeedId != set.expectedFeedId) {
+                emit ActionRejected(policyId, actionHash, RejectionReason.FeedMismatch);
+                revert("OCP: feed mismatch");
+            }
+
             // Verify the oracle is in the declared set
             if (!_isOracleInSet(att.oracle, set.oracles)) {
                 emit ActionRejected(policyId, actionHash, RejectionReason.UnknownOracle);
@@ -204,9 +216,13 @@ contract OracleConfirmedPolicy {
                 }
             }
 
-            // Recover signer and verify it matches declared oracle
+            // FIX L: bind the signed payload to THIS policy and THIS action.
+            // Without policyId + actionHash in the hash, the same attestation
+            // could be replayed across unlimited different actions until the
+            // timestamp ages out. Including them makes each attestation
+            // single-use for one specific action.
             bytes32 dataHash = keccak256(abi.encodePacked(
-                att.dataFeedId, att.price, att.timestamp
+                policyId, actionHash, att.dataFeedId, att.price, att.timestamp
             ));
             bytes32 ethSignedHash = keccak256(abi.encodePacked(
                 "\x19Ethereum Signed Message:\n32", dataHash
@@ -230,6 +246,13 @@ contract OracleConfirmedPolicy {
             if (confirmedPrices[i] > maxPrice) maxPrice = confirmedPrices[i];
         }
 
+        // FIX K: a zero price would divide-by-zero below. Reject explicitly
+        // so a single oracle can't grief the whole authorization with price=0.
+        if (minPrice == 0) {
+            emit ActionRejected(policyId, actionHash, RejectionReason.ZeroPrice);
+            revert("OCP: zero price");
+        }
+
         // spread_bps = (max - min) * 10000 / min
         uint256 spreadBps = ((maxPrice - minPrice) * 10000) / minPrice;
         if (spreadBps > set.toleranceBps) {
@@ -251,11 +274,12 @@ contract OracleConfirmedPolicy {
         address[] memory oracles,
         uint8 threshold,
         uint256 toleranceBps,
-        uint256 maxAgeSeconds
+        uint256 maxAgeSeconds,
+        bytes32 expectedFeedId
     ) {
         OracleSet storage set = oracleSets[policyId];
         require(set.exists, "OCP: unknown policy");
-        return (set.oracles, set.threshold, set.toleranceBps, set.maxAgeSeconds);
+        return (set.oracles, set.threshold, set.toleranceBps, set.maxAgeSeconds, set.expectedFeedId);
     }
 
     function isActionConsumed(bytes32 actionHash) external view returns (bool) {
