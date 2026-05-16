@@ -29,18 +29,25 @@ describe("AttestedExecutionPolicy", function () {
 
     /**
      * Helper: build and sign an AttestationStatement.
+     *
+     * Finding M fix: the attestor now signs over actionHash too, so an
+     * attestation is cryptographically bound to one specific action and
+     * cannot be replayed across different actions within the validity
+     * window. Signed payload:
+     *   (strategyId, actionHash, agent, measurement, timestamp)
      */
     async function buildAttestation(
         signer,
         strategyId,
+        actionHash,
         agent,
         measurement,
         timestamp
     ) {
         const messageHash = ethers.keccak256(
             ethers.solidityPacked(
-                ["bytes32", "address", "bytes32", "uint256"],
-                [strategyId, agent, measurement, timestamp]
+                ["bytes32", "bytes32", "address", "bytes32", "uint256"],
+                [strategyId, actionHash, agent, measurement, timestamp]
             )
         );
         const signature = await signer.signMessage(ethers.getBytes(messageHash));
@@ -81,10 +88,10 @@ describe("AttestedExecutionPolicy", function () {
 
     it("authorizes a valid attested action", async function () {
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("attested-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
 
         const tx = await policy.connect(agents[0]).verifyAttestation(
             actionHash, attestation
@@ -107,10 +114,10 @@ describe("AttestedExecutionPolicy", function () {
         // Acreo refuses because the measurement doesn't match the operator's
         // expected.
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, WRONG_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("tampered-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, WRONG_MEASUREMENT, now
+        );
 
         await expect(
             policy.connect(agents[0]).verifyAttestation(actionHash, attestation)
@@ -121,10 +128,10 @@ describe("AttestedExecutionPolicy", function () {
 
     it("rejects attestation signed by non-attestor", async function () {
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            badAttestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("bad-attestor-1");
+        const attestation = await buildAttestation(
+            badAttestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
 
         await expect(
             policy.connect(agents[0]).verifyAttestation(actionHash, attestation)
@@ -137,10 +144,10 @@ describe("AttestedExecutionPolicy", function () {
         const now = await time.latest();
         // Attestation timestamp from before the validity window
         const oldTime = now - ATTESTATION_VALIDITY_SECONDS - 60;
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, oldTime
-        );
         const actionHash = makeActionHash("expired-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, oldTime
+        );
 
         await expect(
             policy.connect(agents[0]).verifyAttestation(actionHash, attestation)
@@ -151,10 +158,10 @@ describe("AttestedExecutionPolicy", function () {
         const now = await time.latest();
         // Timestamp far in the future
         const futureTime = now + 120;
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, futureTime
-        );
         const actionHash = makeActionHash("future-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, futureTime
+        );
 
         await expect(
             policy.connect(agents[0]).verifyAttestation(actionHash, attestation)
@@ -165,10 +172,10 @@ describe("AttestedExecutionPolicy", function () {
 
     it("rejects attestation for an unauthorized agent", async function () {
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            attestor, strategyId, other.address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("unauth-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, other.address, EXPECTED_MEASUREMENT, now
+        );
 
         await expect(
             policy.connect(other).verifyAttestation(actionHash, attestation)
@@ -178,10 +185,10 @@ describe("AttestedExecutionPolicy", function () {
     it("rejects when sender doesn't match attestation's claimed agent", async function () {
         // The attestation is for agents[0] but agents[1] is submitting
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("mismatch-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
 
         await expect(
             policy.connect(agents[1]).verifyAttestation(actionHash, attestation)
@@ -193,10 +200,10 @@ describe("AttestedExecutionPolicy", function () {
     it("rejects attestation for unknown strategy", async function () {
         const now = await time.latest();
         const unknownId = ethers.keccak256(ethers.toUtf8Bytes("ghost"));
-        const attestation = await buildAttestation(
-            attestor, unknownId, agents[0].address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("ghost-1");
+        const attestation = await buildAttestation(
+            attestor, unknownId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
 
         await expect(
             policy.connect(agents[0]).verifyAttestation(actionHash, attestation)
@@ -207,10 +214,10 @@ describe("AttestedExecutionPolicy", function () {
 
     it("rejects replays of same action hash", async function () {
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("replay-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
 
         await policy.connect(agents[0]).verifyAttestation(actionHash, attestation);
 
@@ -220,6 +227,51 @@ describe("AttestedExecutionPolicy", function () {
         ).to.be.revertedWith("AEP: replay");
     });
 
+    // ── Finding M regression — cross-action attestation replay ────────
+    //
+    // Surfaced by the Phase-1 integrity sandbox (self-asserted-trust
+    // class) and confirmed in source: before the fix, the attestor
+    // signed (strategyId, agent, measurement, timestamp) WITHOUT
+    // actionHash, so one valid attestation authorized ANY action within
+    // the validity window. The per-actionHash replay check did not bind
+    // the attestation to the action. Fix: actionHash is now in the
+    // signed payload (same shape as ASI04 Finding L).
+
+    it("FINDING M: an attestation issued for one action cannot authorize a different action", async function () {
+        const now = await time.latest();
+
+        // Attestor legitimately attests action M1.
+        const actionM1 = makeActionHash("M-action-1");
+        const attForM1 = await buildAttestation(
+            attestor, strategyId, actionM1, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
+        await policy.connect(agents[0]).verifyAttestation(actionM1, attForM1);
+
+        // The agent replays the SAME attestor signature for a different
+        // action M2. Pre-fix this passed (signature didn't bind the
+        // action). Post-fix the recovered signer no longer matches because
+        // actionHash is part of the signed payload.
+        const actionM2 = makeActionHash("M-action-2");
+        await expect(
+            policy.connect(agents[0]).verifyAttestation(actionM2, attForM1)
+        ).to.be.revertedWith("AEP: bad attestor sig");
+    });
+
+    it("FINDING M: an attestation correctly signed for the new action still authorizes", async function () {
+        const now = await time.latest();
+        // Confirms the fix doesn't break legitimate per-action attestation.
+        const actionM3 = makeActionHash("M-action-3");
+        const attForM3 = await buildAttestation(
+            attestor, strategyId, actionM3, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
+        const tx = await policy.connect(agents[0]).verifyAttestation(actionM3, attForM3);
+        const receipt = await tx.wait();
+        const event = receipt.logs.find(
+            (l) => l.fragment && l.fragment.name === "ActionAuthorized"
+        );
+        expect(event).to.not.be.undefined;
+    });
+
     // ── Attestor rotation ─────────────────────────────────────────────
 
     it("operator can rotate the attestor", async function () {
@@ -227,10 +279,10 @@ describe("AttestedExecutionPolicy", function () {
 
         // Attestations from the new attestor should now be valid
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            badAttestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("rotated-1");
+        const attestation = await buildAttestation(
+            badAttestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
 
         await policy.connect(agents[0]).verifyAttestation(actionHash, attestation);
         expect(await policy.isActionConsumed(actionHash)).to.be.true;
@@ -241,10 +293,10 @@ describe("AttestedExecutionPolicy", function () {
 
         // Attestation from old attestor should now fail
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("after-rot-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
 
         await expect(
             policy.connect(agents[0]).verifyAttestation(actionHash, attestation)
@@ -279,10 +331,10 @@ describe("AttestedExecutionPolicy", function () {
 
         // Attestations with new measurement should pass
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, NEW_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("new-meas-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, NEW_MEASUREMENT, now
+        );
 
         await policy.connect(agents[0]).verifyAttestation(actionHash, attestation);
         expect(await policy.isActionConsumed(actionHash)).to.be.true;
@@ -296,10 +348,10 @@ describe("AttestedExecutionPolicy", function () {
 
         // Attestation with OLD measurement should fail
         const now = await time.latest();
-        const attestation = await buildAttestation(
-            attestor, strategyId, agents[0].address, EXPECTED_MEASUREMENT, now
-        );
         const actionHash = makeActionHash("old-meas-1");
+        const attestation = await buildAttestation(
+            attestor, strategyId, actionHash, agents[0].address, EXPECTED_MEASUREMENT, now
+        );
 
         await expect(
             policy.connect(agents[0]).verifyAttestation(actionHash, attestation)

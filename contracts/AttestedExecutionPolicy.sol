@@ -116,7 +116,8 @@ contract AttestedExecutionPolicy {
         address agent;
         bytes32 measurement;
         uint256 timestamp;
-        bytes attestorSignature;   // signature over above fields
+        bytes attestorSignature;   // sig over (strategyId, actionHash,
+                                   // agent, measurement, timestamp)
     }
 
     // ── Storage ───────────────────────────────────────────────────────
@@ -287,9 +288,18 @@ contract AttestedExecutionPolicy {
             revert("AEP: attestation future");
         }
 
-        // Verify the attestor signature
+        // Verify the attestor signature.
+        //
+        // FINDING M (Phase-1 sandbox lead -> confirmed in source): the
+        // attestor must sign over the actionHash too. Without it, a single
+        // valid attestation authorizes ANY action within the validity
+        // window — the agent supplies actionHash freely and the per-
+        // actionHash replay check does not bind the attestation to the
+        // action. Including actionHash makes each attestation single-use
+        // for one specific action (same fix shape as ASI04 Finding L).
         bytes32 messageHash = keccak256(abi.encodePacked(
             attestation.strategyId,
+            actionHash,
             attestation.agent,
             attestation.measurement,
             attestation.timestamp
