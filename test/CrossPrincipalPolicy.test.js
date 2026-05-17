@@ -362,6 +362,38 @@ describe("CrossPrincipalPolicy", function () {
         ).to.be.revertedWith("CPP: same operator");
     });
 
+    // ── Finding N regression (Phase-2 seam test) ──────────────────────
+    // A cross-principal dual-signature policy is only meaningful if the
+    // two signing sides are independent. Before the fix, registerRelationship
+    // accepted the same address on both agent lists, letting one attacker
+    // domain satisfy the "dual" signature alone. Fix enforces address-level
+    // disjointness of the two lists at registration.
+    it("FINDING N: rejects registration where an agent appears on both sides", async function () {
+        const fn1 = makeHash("finding-n-1");
+        const fn2 = makeHash("finding-n-2");
+        const shared = agentsAAddrs[0];
+        await expect(
+            policy.connect(operatorA).registerRelationship(
+                fn1, fn2, operatorB.address,
+                [shared],            // caller side
+                [shared],            // other side — same address (collusion)
+                [CAT_PLACE_ORDER]
+            )
+        ).to.be.revertedWith("CPP: agent on both sides");
+    });
+
+    it("FINDING N: still allows registration with disjoint agent lists", async function () {
+        const fn3 = makeHash("finding-n-3");
+        const fn4 = makeHash("finding-n-4");
+        // disjoint lists must still succeed (fix must not break legit use)
+        await expect(
+            policy.connect(operatorA).registerRelationship(
+                fn3, fn4, operatorB.address,
+                agentsAAddrs, agentsBAddrs, [CAT_PLACE_ORDER]
+            )
+        ).to.not.be.reverted;
+    });
+
     it("rejects registration with zero other operator", async function () {
         const fresh1 = makeHash("zero-op-1");
         const fresh2 = makeHash("zero-op-2");

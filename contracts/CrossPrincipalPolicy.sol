@@ -211,6 +211,25 @@ contract CrossPrincipalPolicy {
         _validateAgentList(agentsForCallerSide);
         _validateAgentList(agentsForOtherSide);
 
+        // FINDING N (Phase-2 seam test): a cross-principal dual-signature
+        // policy is only meaningful if the two signing sides are
+        // INDEPENDENT. Without this check, registerRelationship accepts the
+        // same address on both sides (or an operator's two own addresses),
+        // letting a single trust domain satisfy the "dual" signature
+        // alone — collapsing the cross-principal guarantee to a single-
+        // principal one. Enforce disjoint agent sets at registration.
+        for (uint256 i = 0; i < agentsForCallerSide.length; i++) {
+            for (uint256 j = 0; j < agentsForOtherSide.length; j++) {
+                require(
+                    agentsForCallerSide[i] != agentsForOtherSide[j],
+                    "CPP: agent on both sides"
+                );
+            }
+        }
+        // The two controlling operators must also differ (already checked
+        // above as operatorOther != msg.sender) — together these make the
+        // two sides independent by construction at registration time.
+
         Relationship storage rel = relationships[relationshipId];
         rel.principalA = principalA;
         rel.principalB = principalB;
